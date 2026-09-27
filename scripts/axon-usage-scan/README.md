@@ -27,7 +27,10 @@ Outputs `axon-usage.md` (summary, also printed) and `axon-usage.json` (full deta
   `QueryGateway.query`, axon-kotlin extension functions, …
 * Classes that implement or extend Axon types (interceptors, custom resolvers, …) and `@Bean` methods that return
   Axon infrastructure (engine customization).
-* `axon.*` keys from `application*.yml|properties` / `bootstrap*`.
+* JPA mapping files (`axon-orm.xml` etc.) that override Axon entities: table names, indexes, sequence/table
+  generators, column types. These determine the `axon.thin.event-store.*` settings.
+* `axon.*` keys from `application*.yml|properties` / `bootstrap*`, plus the Spring/Hibernate naming and id keys that
+  change how Axon's entities map to tables.
 * Axon dependencies and versions from `pom.xml`, `build.gradle(.kts)` and `libs.versions.toml`.
 * **Unclassified**: Axon types not yet in `CATALOG`. Add them there with a status.
 

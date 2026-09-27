@@ -5,15 +5,19 @@ import com.dc8.example.task.TaskService
 import com.dc8.example.task.api.AddCommentCommand
 import com.dc8.example.task.api.AssignTaskCommand
 import com.dc8.example.task.api.ChangeTaskStatusCommand
+import com.dc8.example.task.api.CommentNotFoundException
 import com.dc8.example.task.api.CreateTaskCommand
+import com.dc8.example.task.api.CreateTasksFromTemplateCommand
 import com.dc8.example.task.api.DeleteCommentCommand
+import com.dc8.example.task.api.DeleteTaskCommand
+import com.dc8.example.task.api.EditCommentCommand
+import com.dc8.example.task.api.ImportTaskCommand
 import com.dc8.example.task.api.RenameTaskCommand
 import com.dc8.example.task.api.TaskClosedException
-import com.dc8.example.task.api.TaskNotFoundException
 import com.dc8.example.task.api.TaskRenamedEvent
 import com.dc8.example.task.api.TaskStatus
-import com.dc8.example.task.domain.CommentRepository
-import com.dc8.example.task.domain.TaskRepository
+import com.dc8.example.task.api.TasksImportedEvent
+import com.dc8.example.task.projection.CommentViewRepository
 import com.dc8.example.task.projection.TaskActivityRepository
 import com.dc8.example.task.projection.TaskSummaryRepository
 import com.dc8.example.task.query.TaskQueryService
@@ -26,10 +30,15 @@ import org.axonframework.commandhandling.GenericCommandMessage
 import org.axonframework.commandhandling.NoHandlerForCommandException
 import org.axonframework.commandhandling.gateway.CommandGateway
 import org.axonframework.eventhandling.gateway.EventGateway
+import org.axonframework.eventsourcing.AggregateDeletedException
 import org.axonframework.messaging.MetaData
+import org.axonframework.modelling.command.AggregateNotFoundException
+import org.axonframework.modelling.command.AggregateStreamCreationException
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.jdbc.core.JdbcTemplate
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -38,8 +47,8 @@ import java.util.concurrent.atomic.AtomicReference
  * Behavioural contract shared by every engine. Each app module extends this with a `@SpringBootTest`
  * subclass, so the very same assertions run against real Axon 4 and against axon-thin.
  *
- * Engine configuration assumed by the contract: subscribing event processors, no event store,
- * event handler errors propagate (roll back the command).
+ * Engine configuration assumed by the contract: event-sourced aggregates on Axon's `domain_event_entry` layout
+ * (tables prefixed `axon_`), Jackson serializer, subscribing event processors, event handler errors propagate.
  */
 abstract class TaskContractTest {
 
@@ -48,14 +57,18 @@ abstract class TaskContractTest {
     @Autowired lateinit var bulk: BulkCommandGateway
     @Autowired lateinit var taskService: TaskService
     @Autowired lateinit var queries: TaskQueryService
-    @Autowired lateinit var tasks: TaskRepository
-    @Autowired lateinit var comments: CommentRepository
     @Autowired lateinit var summaries: TaskSummaryRepository
+    @Autowired lateinit var comments: CommentViewRepository
     @Autowired lateinit var activities: TaskActivityRepository
+    @Autowired lateinit var jdbc: JdbcTemplate
+
+    protected open val eventTable = "axon_domain_event_entry"
+    protected val stored by lazy { StoredEvents(jdbc, eventTable) }
 
     @BeforeEach
     fun cleanDatabase() {
-        listOf(activities, summaries, comments, tasks).forEach { it.deleteAllInBatch() }
+        listOf(activities, summaries, comments).forEach { it.deleteAllInBatch() }
+        stored.deleteAll()
     }
 
     private fun id() = UUID.randomUUID().toString()
@@ -66,13 +79,12 @@ abstract class TaskContractTest {
     // ---- command gateway --------------------------------------------------------------------------------------------
 
     @Test
-    fun `sendAndWait returns the handler result and projections are updated before it returns`() {
+    fun `constructor command handler returns the aggregate id and projections are updated before it returns`() {
         val taskId = id()
 
         val result: String = commandGateway.sendAndWait(CreateTaskCommand(taskId, "  Write docs  ", "all of them"))
 
         assertThat(result).isEqualTo(taskId)
-        assertThat(tasks.findById(taskId)).hasValueSatisfying { assertThat(it.title).isEqualTo("Write docs") }
         val summary = queries.summary(taskId)!!
         assertThat(summary.title).isEqualTo("Write docs")
         assertThat(summary.status).isEqualTo(TaskStatus.TODO)
@@ -103,7 +115,7 @@ abstract class TaskContractTest {
     fun `send completes the future exceptionally with the original exception`() {
         val future = commandGateway.send<Any>(RenameTaskCommand(id(), "x"))
 
-        assertThatThrownBy { future.get(5, TimeUnit.SECONDS) }.cause().isInstanceOf(TaskNotFoundException::class.java)
+        assertThatThrownBy { future.get(5, TimeUnit.SECONDS) }.cause().isInstanceOf(AggregateNotFoundException::class.java)
     }
 
     @Test
@@ -122,16 +134,14 @@ abstract class TaskContractTest {
     }
 
     @Test
-    fun `metadata and spring beans are resolved as handler parameters`() {
+    fun `metadata is resolved as handler parameter`() {
         val taskId = id()
         val command = GenericCommandMessage.asCommandMessage<CreateTaskCommand>(CreateTaskCommand(taskId, "Meta"))
             .andMetaData(MetaData.with("userId", "alice"))
 
         commandGateway.sendAndWait<String>(command)
 
-        val task = tasks.findById(taskId).orElseThrow()
-        assertThat(task.createdBy).isEqualTo("alice")
-        assertThat(task.createdAt).isNotNull()
+        assertThat(queries.summary(taskId)!!.createdBy).isEqualTo("alice")
     }
 
     @Test
@@ -140,29 +150,18 @@ abstract class TaskContractTest {
 
         commandGateway.sendAndWait<String>(CreateTaskCommand(taskId, "Meta"), MetaData.with("userId", "bob"))
 
-        assertThat(tasks.findById(taskId).orElseThrow().createdBy).isEqualTo("bob")
+        assertThat(queries.summary(taskId)!!.createdBy).isEqualTo("bob")
     }
 
     @Test
-    fun `runtime exception from handler is rethrown as-is and nothing is persisted`() {
+    fun `runtime exception from handler is rethrown as-is and nothing is stored`() {
         val taskId = id()
 
         assertThatThrownBy { commandGateway.sendAndWait<Any>(CreateTaskCommand(taskId, "  ")) }
             .isExactlyInstanceOf(IllegalArgumentException::class.java)
             .hasMessage("Task title must not be blank")
-        assertThat(tasks.existsById(taskId)).isFalse()
+        assertThat(stored.count()).isZero()
         assertThat(queries.summary(taskId)).isNull()
-    }
-
-    @Test
-    fun `business rule violation keeps previous state`() {
-        val taskId = createTask()
-        commandGateway.sendAndWait<Any>(ChangeTaskStatusCommand(taskId, TaskStatus.DONE))
-
-        assertThatThrownBy { commandGateway.sendAndWait<Any>(AddCommentCommand(id(), taskId, "bob", "late")) }
-            .isInstanceOf(TaskClosedException::class.java)
-        assertThat(queries.comments(taskId)).isEmpty()
-        assertThat(queries.summary(taskId)!!.commentCount).isZero()
     }
 
     @Test
@@ -171,18 +170,162 @@ abstract class TaskContractTest {
             .isInstanceOf(NoHandlerForCommandException::class.java)
     }
 
+    // ---- aggregates -------------------------------------------------------------------------------------------------
+
+    @Test
+    fun `command for a missing aggregate fails with AggregateNotFoundException`() {
+        assertThatThrownBy { commandGateway.sendAndWait<Any>(RenameTaskCommand("missing", "x")) }
+            .isExactlyInstanceOf(AggregateNotFoundException::class.java)
+    }
+
+    @Test
+    fun `creating an existing aggregate fails with AggregateStreamCreationException`() {
+        val taskId = createTask()
+
+        assertThatThrownBy { commandGateway.sendAndWait<Any>(CreateTaskCommand(taskId, "again")) }
+            .isInstanceOf(AggregateStreamCreationException::class.java)
+        assertThat(stored.forAggregate(taskId)).hasSize(1)
+    }
+
+    @Test
+    fun `state is rebuilt from stored events`() {
+        val taskId = createTask()
+        commandGateway.sendAndWait<String>(AddCommentCommand(taskId, "c1", "ann", "one"))
+        commandGateway.sendAndWait<Any>(DeleteCommentCommand(taskId, "c1"))
+
+        // the aggregate only knows c1 is gone because it replays CommentAdded + CommentDeleted
+        assertThatThrownBy { commandGateway.sendAndWait<Any>(EditCommentCommand(taskId, "c1", "edited")) }
+            .isInstanceOf(CommentNotFoundException::class.java)
+
+        commandGateway.sendAndWait<Any>(ChangeTaskStatusCommand(taskId, TaskStatus.DONE))
+        assertThatThrownBy { commandGateway.sendAndWait<Any>(AddCommentCommand(taskId, "c2", "bob", "late")) }
+            .isInstanceOf(TaskClosedException::class.java)
+        assertThat(queries.comments(taskId)).isEmpty()
+    }
+
+    @Test
+    fun `markDeleted makes the aggregate unavailable`() {
+        val taskId = createTask()
+
+        commandGateway.sendAndWait<Any>(DeleteTaskCommand(taskId))
+
+        assertThat(queries.summary(taskId)).isNull()
+        assertThatThrownBy { commandGateway.sendAndWait<Any>(RenameTaskCommand(taskId, "zombie")) }
+            .isInstanceOf(AggregateDeletedException::class.java)
+    }
+
+    @Test
+    fun `CREATE_IF_MISSING creates, then updates the same aggregate`() {
+        val taskId = id()
+
+        val first: Any? = commandGateway.sendAndWait(ImportTaskCommand(taskId, "v1"))
+        val second: Any? = commandGateway.sendAndWait(ImportTaskCommand(taskId, "v2"))
+
+        assertThat(first).isEqualTo(taskId)
+        assertThat(second).isEqualTo(taskId)
+        assertThat(stored.forAggregate(taskId).map { it.payloadType.substringAfterLast('.') })
+            .containsExactly("TaskCreatedEvent", "TaskRenamedEvent")
+        assertThat(queries.summary(taskId)!!.title).isEqualTo("v2")
+    }
+
+    @Test
+    fun `external handler dispatches nested commands in the same unit of work`() {
+        val template = GenericCommandMessage.asCommandMessage<CreateTasksFromTemplateCommand>(
+            CreateTasksFromTemplateCommand("Sprint", listOf("plan", "build", "ship")),
+        )
+
+        val ids: List<String> = commandGateway.sendAndWait(template)
+
+        assertThat(ids).hasSize(3)
+        assertThat(ids.map { queries.summary(it)!!.title }).containsExactly("Sprint plan", "Sprint build", "Sprint ship")
+        // traceId flows command -> nested commands -> their events
+        assertThat(stored.all()).hasSize(4).allSatisfy { assertThat(it.metaData["traceId"]).isEqualTo(template.identifier) }
+    }
+
+    @Test
+    fun `AggregateLifecycle corner cases match Axon`() {
+        val probeId = id()
+
+        commandGateway.sendAndWait<Any>(StartProbeCommand(probeId))
+        val observed: String = commandGateway.sendAndWait(PokeProbeCommand(probeId))
+
+        val rows = stored.forAggregate(probeId)
+        assertThat(rows.map { it.payloadType.substringAfterLast('.') to it.payload - "probeId" }).containsExactly(
+            "ProbeStartedEvent" to emptyMap<String, Any?>(),
+            // andThenApply (queued while the constructor ran) goes before the apply nested in the sourcing handler
+            "ProbeStepEvent" to mapOf("step" to "and-then-apply", "version" to 0),
+            // getVersion() inside the sourcing handler already reflects the event being handled
+            "ProbeStepEvent" to mapOf("step" to "from-sourcing-handler", "version" to 0),
+            "ProbePokedEvent" to mapOf("live" to true),
+        )
+        assertThat(rows.map { it.sequenceNumber }).containsExactly(0L, 1L, 2L, 3L)
+        assertThat(observed).isEqualTo(PROBE_OBSERVED)
+    }
+
+    // ---- storage format (what the other engine / other services will read) -----------------------------------------
+
+    @Test
+    fun `aggregate events are stored in Axon's domain_event_entry layout`() {
+        val taskId = id()
+        val create = GenericCommandMessage.asCommandMessage<CreateTaskCommand>(CreateTaskCommand(taskId, "Stored", "d"))
+            .andMetaData(mapOf("userId" to "zoe"))
+        commandGateway.sendAndWait<String>(create)
+        commandGateway.sendAndWait<Any>(AssignTaskCommand(taskId, "zoe"))
+
+        val rows = stored.forAggregate(taskId)
+
+        assertThat(rows).hasSize(2)
+        val (created, assigned) = rows
+        assertThat(rows.map { it.sequenceNumber }).containsExactly(0L, 1L)
+        assertThat(rows).allSatisfy {
+            assertThat(it.type).isEqualTo("Task")
+            assertThat(it.aggregateIdentifier).isEqualTo(taskId)
+            assertThat(Instant.parse(it.timeStamp)).isBefore(Instant.now().plusSeconds(1))
+            assertThat(it.timeStamp).matches("""\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z""")
+        }
+        assertThat(created.globalIndex).isLessThan(assigned.globalIndex)
+        assertThat(created.payloadType).isEqualTo("com.dc8.example.task.api.TaskCreatedEvent")
+        assertThat(created.payloadRevision).isEqualTo("2")
+        assertThat(created.payload).isEqualTo(
+            mapOf("taskId" to taskId, "title" to "Stored", "description" to "d", "createdBy" to "zoe"),
+        )
+        assertThat(created.metaData).containsEntry("correlationId", create.identifier)
+            .containsEntry("traceId", create.identifier)
+            .doesNotContainKey("userId") // command metadata is not copied, only correlation data
+        assertThat(assigned.payloadType).isEqualTo("com.dc8.example.task.api.TaskAssignedEvent")
+        assertThat(assigned.payloadRevision).isNull()
+        assertThat(assigned.payload).isEqualTo(mapOf("taskId" to taskId, "assignee" to "zoe"))
+        assertThat(queries.activity(taskId).map { it.eventId to it.sequenceNumber })
+            .containsExactly(created.eventIdentifier to 0L, assigned.eventIdentifier to 1L)
+    }
+
+    @Test
+    fun `events published outside a command are handled and stored as non-aggregate events`() {
+        val taskId = createTask("Before")
+
+        eventGateway.publish(TaskRenamedEvent(taskId, "After"), TasksImportedEvent(7, "manual"))
+
+        assertThat(queries.summary(taskId)!!.title).isEqualTo("After")
+        val nonAggregate = stored.all().filter { it.type == null }
+        assertThat(nonAggregate).hasSize(2).allSatisfy {
+            assertThat(it.aggregateIdentifier).isEqualTo(it.eventIdentifier)
+            assertThat(it.sequenceNumber).isZero()
+        }
+        assertThat(nonAggregate.last().payload).isEqualTo(mapOf("count" to 7, "source" to "manual"))
+    }
+
     // ---- event handling ---------------------------------------------------------------------------------------------
 
     @Test
-    fun `comment lifecycle keeps the summary counter in sync`() {
+    fun `comment lifecycle keeps the read models in sync`() {
         val taskId = createTask()
-        val first = id()
-        commandGateway.sendAndWait<String>(AddCommentCommand(first, taskId, "ann", "one"))
-        commandGateway.sendAndWait<String>(AddCommentCommand(id(), taskId, "ann", "two"))
-        commandGateway.sendAndWait<Any>(DeleteCommentCommand(first))
+        commandGateway.sendAndWait<String>(AddCommentCommand(taskId, "c1", "ann", "one"))
+        commandGateway.sendAndWait<String>(AddCommentCommand(taskId, "c2", "ann", "two"))
+        commandGateway.sendAndWait<Any>(EditCommentCommand(taskId, "c2", "two!"))
+        commandGateway.sendAndWait<Any>(DeleteCommentCommand(taskId, "c1"))
 
         assertThat(queries.summary(taskId)!!.commentCount).isEqualTo(1)
-        assertThat(queries.comments(taskId).map { it.text }).containsExactly("two")
+        assertThat(queries.comments(taskId).map { it.text }).containsExactly("two!")
     }
 
     @Test
@@ -196,29 +339,20 @@ abstract class TaskContractTest {
         val log = queries.activity(taskId)
         assertThat(log.map { it.type })
             .containsExactly("TaskCreatedEvent", "TaskAssignedEvent", "TaskStatusChangedEvent")
+        assertThat(log.map { it.sequenceNumber }).containsExactly(0L, 1L, 2L)
         assertThat(log.map { it.eventId }).doesNotHaveDuplicates().doesNotContainNull()
-        assertThat(log).allSatisfy { assertThat(it.occurredAt).isNotNull() }
         assertThat(log.first().correlationId).isEqualTo(create.identifier)
     }
 
     @Test
-    fun `event handler failure rolls back the command (same transaction)`() {
+    fun `event handler failure rolls back the command and its events (same transaction)`() {
         val taskId = id()
 
         assertThatThrownBy { commandGateway.sendAndWait<Any>(CreateTaskCommand(taskId, FailingProjection.POISON_TITLE)) }
             .satisfies({ assertThat(rootCause(it)).hasMessage(FailingProjection.FAILURE_MESSAGE) })
-        assertThat(tasks.existsById(taskId)).isFalse()
+        assertThat(stored.count()).isZero()
         assertThat(queries.summary(taskId)).isNull()
         assertThat(queries.activity(taskId)).isEmpty()
-    }
-
-    @Test
-    fun `events published outside a command are handled immediately`() {
-        val taskId = createTask("Before")
-
-        eventGateway.publish(TaskRenamedEvent(taskId, "After"))
-
-        assertThat(queries.summary(taskId)!!.title).isEqualTo("After")
     }
 
     // ---- bulk -------------------------------------------------------------------------------------------------------
@@ -231,43 +365,54 @@ abstract class TaskContractTest {
 
         assertThat(results).containsExactlyElementsOf(ids)
         assertThat(queries.countTasks()).isEqualTo(50)
+        assertThat(stored.count()).isEqualTo(50)
     }
 
     @Test
     fun `sendAllAndWait is all-or-nothing`() {
-        val ok1 = id()
-        val ok2 = id()
-
         assertThatThrownBy {
             bulk.sendAllAndWait(
-                listOf(CreateTaskCommand(ok1, "one"), CreateTaskCommand(ok2, "two"), CreateTaskCommand(id(), " ")),
+                listOf(CreateTaskCommand(id(), "one"), CreateTaskCommand(id(), "two"), CreateTaskCommand(id(), " ")),
             )
         }.isExactlyInstanceOf(IllegalArgumentException::class.java)
 
-        assertThat(tasks.count()).isZero()
+        assertThat(stored.count()).isZero()
         assertThat(summaries.count()).isZero()
         assertThat(activities.count()).isZero()
     }
 
     @Test
-    fun `sendAllAndWait lets later commands see earlier effects`() {
+    fun `sendAllAndWait rolls back on a duplicate aggregate inside the batch`() {
         val taskId = id()
-        val commentId = id()
+
+        assertThatThrownBy {
+            bulk.sendAllAndWait(listOf(CreateTaskCommand(taskId, "one"), CreateTaskCommand(taskId, "dup")))
+        }.isInstanceOf(AggregateStreamCreationException::class.java)
+
+        assertThat(stored.count()).isZero()
+        assertThat(summaries.count()).isZero()
+    }
+
+    @Test
+    fun `sendAllAndWait lets later commands see earlier effects on the same aggregate`() {
+        val taskId = id()
 
         val results = bulk.sendAllAndWait(
             listOf(
                 CreateTaskCommand(taskId, "Bulk"),
-                AddCommentCommand(commentId, taskId, "dan", "first!"),
+                AddCommentCommand(taskId, "c1", "dan", "first!"),
                 AssignTaskCommand(taskId, "dan"),
                 ChangeTaskStatusCommand(taskId, TaskStatus.IN_PROGRESS),
+                ChangeTaskStatusCommand(taskId, TaskStatus.DONE),
             ),
         )
 
-        assertThat(results).containsExactly(taskId, commentId, null, TaskStatus.TODO)
+        assertThat(results).containsExactly(taskId, "c1", null, TaskStatus.TODO, TaskStatus.IN_PROGRESS)
         val summary = queries.summary(taskId)!!
         assertThat(summary.commentCount).isEqualTo(1)
         assertThat(summary.assignee).isEqualTo("dan")
-        assertThat(summary.status).isEqualTo(TaskStatus.IN_PROGRESS)
+        assertThat(summary.status).isEqualTo(TaskStatus.DONE)
+        assertThat(stored.forAggregate(taskId).map { it.sequenceNumber }).containsExactly(0L, 1L, 2L, 3L, 4L)
     }
 
     @Test
@@ -278,7 +423,7 @@ abstract class TaskContractTest {
             listOf(GenericCommandMessage.asCommandMessage<Any>(CreateTaskCommand(taskId, "m")).andMetaData(mapOf("userId" to "eve"))),
         )
 
-        assertThat(tasks.findById(taskId).orElseThrow().createdBy).isEqualTo("eve")
+        assertThat(queries.summary(taskId)!!.createdBy).isEqualTo("eve")
     }
 
     @Test
@@ -287,12 +432,25 @@ abstract class TaskContractTest {
         val b = createTask("b")
 
         assertThatThrownBy { taskService.closeAll(listOf(a, b, "missing")) }
-            .isInstanceOf(TaskNotFoundException::class.java)
+            .isInstanceOf(AggregateNotFoundException::class.java)
         assertThat(queries.byStatus(TaskStatus.DONE)).isEmpty()
+        assertThat(stored.count()).isEqualTo(2)
 
         val previous = taskService.closeAll(listOf(a, b))
         assertThat(previous).containsExactlyInAnyOrderEntriesOf(mapOf(a to TaskStatus.TODO, b to TaskStatus.TODO))
         assertThat(queries.byStatus(TaskStatus.DONE).map { it.taskId }).containsExactlyInAnyOrder(a, b)
+    }
+
+    @Test
+    fun `bulk upsert creates missing and updates existing aggregates`() {
+        val existing = createTask("old title")
+        val fresh = id()
+
+        val ids = taskService.upsertTasks(linkedMapOf(existing to "new title", fresh to "brand new"))
+
+        assertThat(ids).containsExactly(existing, fresh)
+        assertThat(queries.summary(existing)!!.title).isEqualTo("new title")
+        assertThat(queries.summary(fresh)!!.title).isEqualTo("brand new")
     }
 
     @Test
@@ -301,12 +459,19 @@ abstract class TaskContractTest {
 
         assertThat(ids).hasSize(1_000).doesNotHaveDuplicates()
         assertThat(queries.countTasks()).isEqualTo(1_000)
-        assertThat(activities.count()).isEqualTo(1_000)
+        assertThat(stored.count()).isEqualTo(1_000)
+        assertThat(stored.all().map { it.globalIndex }).doesNotHaveDuplicates()
     }
 
     // ---- helpers ----------------------------------------------------------------------------------------------------
 
     data class UnknownCommand(val id: String)
+
+    companion object {
+        // observed on Axon 4.13 (the reference); axon-thin must produce the same
+        // 3 events replayed while not live; @AggregateVersion is only read (state-stored), never written for event sourcing
+        const val PROBE_OBSERVED = "replayed=3 before=null after=null"
+    }
 
     private fun rootCause(e: Throwable): Throwable = generateSequence(e) { it.cause }.last()
 

@@ -2,9 +2,14 @@ spring:
   datasource:
     url: jdbc:h2:mem:tasks-axon4;DB_CLOSE_DELAY=-1
   jpa:
+    mapping-resources: META-INF/axon-orm.xml
     hibernate:
       ddl-auto: create-drop
     open-in-view: false
 axon:
   axonserver:
     enabled: false
+  serializer:
+    general: jackson
+    events: jackson
+    messages: jackson

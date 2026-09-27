@@ -1,6 +1,10 @@
 spring:
   datasource:
     url: jdbc:h2:mem:tasks-thin;DB_CLOSE_DELAY=-1
+  sql:
+    init:
+      # Axon's tables (thin has no JPA entities for them); in a migrated project they already exist
+      schema-locations: classpath:axon-thin/schema/h2.sql
   jpa:
     hibernate:
       ddl-auto: create-drop
@@ -9,3 +13,5 @@ axon:
   thin:
     # match the Axon 4 app (PropagatingErrorHandler): a failing projection rolls the command back
     event-handler-error-mode: propagate
+    event-store:
+      table-prefix: axon_   # same tables the Axon 4 app maps via META-INF/axon-orm.xml

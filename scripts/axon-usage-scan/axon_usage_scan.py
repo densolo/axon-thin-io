@@ -38,7 +38,7 @@ CATALOG: dict[str, tuple[str, str, str]] = {
     "CommandResultMessage": ("commands", S, ""),
     "CommandExecutionException": ("commands", S, "wraps checked exceptions, like DefaultCommandGateway"),
     "NoHandlerForCommandException": ("commands", S, ""),
-    "TargetAggregateIdentifier": ("aggregates", P, "only used for routing; harmless but lives in axon-modelling"),
+    "TargetAggregateIdentifier": ("aggregates", S, "field or getter"),
     "RoutingKey": ("distribution", NA, "local bus only"),
     "CommandGatewayFactory": ("commands", M, "custom gateway interfaces"),
     "Timeout": ("commands", M, ""),
@@ -50,8 +50,8 @@ CATALOG: dict[str, tuple[str, str, str]] = {
     "EventBus": ("events", M, "use EventGateway"),
     "EventMessage": ("messages", S, "handler parameter"),
     "GenericEventMessage": ("messages", S, ""),
-    "DomainEventMessage": ("messages", M, "event-sourcing only"),
-    "ProcessingGroup": ("events", P, "ignored: all handlers behave as one subscribing group (needs axon-configuration types)"),
+    "DomainEventMessage": ("messages", S, ""),
+    "ProcessingGroup": ("events", NA, "ignored: all handlers run as one subscribing group; the name only matters for tokens/sagas"),
     "EventProcessingConfigurer": ("config", P, "subscribing mode is the only mode"),
     "SubscribingEventProcessor": ("events", S, "implicit"),
     "TrackingEventProcessor": ("events", M, "async/tracking processors"),
@@ -72,9 +72,9 @@ CATALOG: dict[str, tuple[str, str, str]] = {
     "MessageIdentifier": ("parameters", S, ""),
     "Timestamp": ("parameters", S, "events only"),
     "MetaData": ("messages", S, "parameter + gateway overloads"),
-    "SequenceNumber": ("parameters", M, "event-sourcing only"),
-    "SourceId": ("parameters", M, "event-sourcing only"),
-    "AggregateType": ("parameters", M, ""),
+    "SequenceNumber": ("parameters", S, ""),
+    "SourceId": ("parameters", S, ""),
+    "AggregateType": ("parameters", S, ""),
     "ConcludesBatch": ("parameters", M, ""),
     "Message": ("messages", S, ""),
     "MessageDispatchInterceptor": ("interceptors", S, "registerDispatchInterceptor on both gateways"),
@@ -87,42 +87,49 @@ CATALOG: dict[str, tuple[str, str, str]] = {
     "SimpleCorrelationDataProvider": ("messages", M, ""),
     "MultiCorrelationDataProvider": ("messages", M, ""),
     "UnitOfWork": ("unit-of-work", M, "thin has an internal unit of work only"),
+    "AggregateMember": ("aggregates", M, "child entities with their own handlers"),
+    "AggregateDeletedException": ("aggregates", S, ""),
+    "AggregateStreamCreationException": ("aggregates", S, ""),
+    "ConcurrencyException": ("aggregates", S, ""),
+    "TargetAggregateVersion": ("aggregates", M, "expected-version check"),
+    "SnapshotEventEntry": ("event-store", M, "snapshots are ignored"),
+    "DomainEventEntry": ("event-store", S, ""),
+    "GenericDomainEventMessage": ("messages", S, ""),
     "CurrentUnitOfWork": ("unit-of-work", M, ""),
     "DefaultUnitOfWork": ("unit-of-work", M, ""),
     "TransactionManager": ("transactions", P, "Spring PlatformTransactionManager is used directly"),
     "SpringTransactionManager": ("transactions", P, ""),
     # aggregates / event sourcing
-    "Aggregate": ("aggregates", M, "@Aggregate"),
-    "AggregateRoot": ("aggregates", M, ""),
-    "AggregateIdentifier": ("aggregates", M, ""),
-    "AggregateVersion": ("aggregates", M, ""),
-    "AggregateMember": ("aggregates", M, ""),
-    "EntityId": ("aggregates", M, ""),
-    "AggregateLifecycle": ("aggregates", M, "apply(), markDeleted(), createNew()"),
-    "EventSourcingHandler": ("aggregates", M, ""),
-    "CreationPolicy": ("aggregates", M, ""),
-    "AggregateCreationPolicy": ("aggregates", M, ""),
+    "Aggregate": ("aggregates", S, "event-sourced; state-stored (JPA) aggregates not yet"),
+    "AggregateRoot": ("aggregates", S, ""),
+    "AggregateIdentifier": ("aggregates", S, ""),
+    "AggregateVersion": ("aggregates", P, "not written for event-sourced aggregates (same as Axon)"),
+    "EntityId": ("aggregates", M, "aggregate members"),
+    "AggregateLifecycle": ("aggregates", P, "apply/andThenApply/isLive/getVersion/markDeleted; createNew() missing"),
+    "EventSourcingHandler": ("aggregates", S, ""),
+    "CreationPolicy": ("aggregates", S, "ALWAYS, CREATE_IF_MISSING, NEVER"),
+    "AggregateCreationPolicy": ("aggregates", S, ""),
     "Repository": ("aggregates", M, "org.axonframework.modelling.command.Repository"),
     "GenericJpaRepository": ("aggregates", M, "state-stored JPA aggregates"),
-    "EventSourcingRepository": ("aggregates", M, ""),
-    "AggregateNotFoundException": ("aggregates", M, ""),
+    "EventSourcingRepository": ("aggregates", P, "built in, not exposed"),
+    "AggregateNotFoundException": ("aggregates", S, ""),
     "ConflictResolver": ("aggregates", M, ""),
-    "Snapshotter": ("event-store", NA, ""),
-    "SnapshotTriggerDefinition": ("event-store", NA, ""),
-    "EventStore": ("event-store", NA, "thin keeps no event store"),
-    "EventStorageEngine": ("event-store", NA, ""),
-    "JpaEventStorageEngine": ("event-store", NA, ""),
-    "JdbcEventStorageEngine": ("event-store", NA, ""),
-    "EmbeddedEventStore": ("event-store", NA, ""),
+    "Snapshotter": ("event-store", M, "snapshots are ignored: loads replay all events"),
+    "SnapshotTriggerDefinition": ("event-store", M, "snapshots are ignored: loads replay all events"),
+    "EventStore": ("event-store", P, "Axon-compatible JDBC store, not exposed as EventStore"),
+    "EventStorageEngine": ("event-store", P, "built-in JDBC engine; Axon tables"),
+    "JpaEventStorageEngine": ("event-store", S, "same tables/rows; prefix via axon.thin.event-store.table-prefix"),
+    "JdbcEventStorageEngine": ("event-store", P, "check column names: thin uses the JPA (snake_case) layout"),
+    "EmbeddedEventStore": ("event-store", S, "equivalent"),
     "TokenStore": ("event-store", NA, ""),
     "JpaTokenStore": ("event-store", NA, ""),
-    "Upcaster": ("serialization", NA, ""),
-    "EventUpcaster": ("serialization", NA, ""),
-    "SingleEventUpcaster": ("serialization", NA, ""),
-    "Revision": ("serialization", NA, "only matters for stored/serialized events"),
-    "Serializer": ("serialization", NA, "thin never serializes"),
-    "JacksonSerializer": ("serialization", NA, ""),
-    "XStreamSerializer": ("serialization", NA, ""),
+    "Upcaster": ("serialization", M, "stored events are read back: upcasters matter now"),
+    "EventUpcaster": ("serialization", M, ""),
+    "SingleEventUpcaster": ("serialization", M, ""),
+    "Revision": ("serialization", S, "payload_revision"),
+    "Serializer": ("serialization", S, "a bean named eventSerializer overrides the default"),
+    "JacksonSerializer": ("serialization", S, "default, built like Axon's autoconfig"),
+    "XStreamSerializer": ("serialization", M, "only Jackson is wired by default"),
     # sagas & deadlines
     "Saga": ("sagas", M, ""),
     "SagaEventHandler": ("sagas", M, ""),
@@ -192,6 +199,7 @@ class Report:
     bean_overrides: dict[str, list[Occurrence]] = field(default_factory=lambda: defaultdict(list))
     handlers: list[dict] = field(default_factory=list)
     config_keys: dict[str, list[Occurrence]] = field(default_factory=lambda: defaultdict(list))
+    orm_overrides: list[dict] = field(default_factory=list)
     dependencies: dict[str, set] = field(default_factory=lambda: defaultdict(set))
     packages: Counter = field(default_factory=Counter)
 
@@ -553,9 +561,16 @@ def scan_config(path: Path, rel: str, module: str, rep: Report) -> None:
     else:
         keys = flatten_yaml_keys(text)
     for key, ln in keys:
-        if key.startswith("axon."):
+        if key.startswith("axon.") or RELEVANT_SPRING_KEYS.match(key):
             rep.config_keys[key].append(Occurrence(rel, ln, module, snippet_at(lines, ln)))
 
+
+# Spring/Hibernate settings that change how Axon's JPA entities map to tables
+RELEVANT_SPRING_KEYS = re.compile(
+    r"^spring\.jpa\.(mapping-resources|hibernate\.naming\..*|hibernate\.use-new-id-generator-mappings"
+    r"|properties\.hibernate\.(physical_naming_strategy|implicit_naming_strategy|id\..*|id_new_generator_mappings"
+    r"|default_schema|dialect))$"
+)
 
 DEP_POM_RE = re.compile(r"<groupId>\s*(org\.axonframework[\w.]*)\s*</groupId>\s*<artifactId>\s*([\w.\-]+)\s*"
                         r"</artifactId>(?:\s*<version>\s*([^<]+?)\s*</version>)?")
@@ -574,6 +589,42 @@ def scan_build(path: Path, rel: str, rep: Report) -> None:
         rep.dependencies["(version property)"].add(f"{rel}: {m.group(0).strip()}")
 
 
+def scan_orm(path: Path, rel: str, rep: Report) -> None:
+    """JPA mapping files overriding Axon entities (e.g. axon-orm.xml): table names, generators, columns."""
+    import xml.etree.ElementTree as ET
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if "org.axonframework" not in text or "entity-mappings" not in text:
+        return
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        rep.orm_overrides.append({"file": rel, "error": str(e)})
+        return
+
+    def local(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    def describe(el) -> list[str]:
+        out = []
+        for child in el.iter():
+            name = local(child.tag)
+            if name in ("table", "sequence-generator", "table-generator", "generated-value", "index",
+                        "column", "attribute-override", "lob", "column-result", "id-class"):
+                attrs = ", ".join(f"{k}={v}" for k, v in child.attrib.items())
+                out.append(f"{name}({attrs})" if attrs else name)
+        return out
+
+    for el in root:
+        name = local(el.tag)
+        if name in ("sequence-generator", "table-generator"):
+            rep.orm_overrides.append({"file": rel, "entity": "(global)", "overrides": describe(el)})
+        elif name in ("entity", "mapped-superclass", "embeddable") and "org.axonframework" in el.get("class", ""):
+            rep.orm_overrides.append({
+                "file": rel, "entity": el.get("class"), "kind": name,
+                "metadata_complete": el.get("metadata-complete"), "overrides": describe(el),
+            })
+
+
 def scan(roots: list[Path], excludes: set[str]) -> Report:
     rep = Report(roots=[str(r) for r in roots])
     for root in roots:
@@ -585,6 +636,8 @@ def scan(roots: list[Path], excludes: set[str]) -> Report:
                 rel = str(p.relative_to(root)) if len(roots) == 1 else f"{root.name}/{p.relative_to(root)}"
                 if fn in BUILD_FILES:
                     scan_build(p, rel, rep)
+                elif fn.endswith(".xml") and fn != "pom.xml":
+                    scan_orm(p, rel, rep)
                 elif CONFIG_RE.match(fn):
                     scan_config(p, rel, find_module(p, root, cache), rep)
                 elif p.suffix in SOURCE_EXT:
@@ -660,6 +713,7 @@ def to_json(rep: Report, examples: int) -> dict:
         "supertypes": {k: occs(v) for k, v in rep.supertypes.items()},
         "bean_overrides": {k: occs(v) for k, v in rep.bean_overrides.items()},
         "config_keys": {k: occs(v) for k, v in sorted(rep.config_keys.items())},
+        "orm_overrides": rep.orm_overrides,
         "handler_findings": [
             {"shape": k, "thin": s, "count": c, "examples": [o.__dict__ for o in v[:examples]]}
             for k, s, c, v in handler_findings(rep)
@@ -721,8 +775,17 @@ def to_markdown(rep: Report, examples: int) -> str:
         w("\n## `@Bean`s providing Axon infrastructure (engine customization)\n")
         for k, v in sorted(rep.bean_overrides.items(), key=lambda kv: -len(kv[1])):
             w(f"- `{k}` × {len(v)}: {ex(v)}")
+    if rep.orm_overrides:
+        w("\n## JPA mapping overrides of Axon entities (orm.xml)\n")
+        w("Drives axon-thin's `axon.thin.event-store.*` settings: table prefix/names, global-index generator, "
+          "payload column types (`oid` vs `bytea` on PostgreSQL).\n")
+        for o in rep.orm_overrides:
+            if "error" in o:
+                w(f"- `{o['file']}`: unparseable ({o['error']})")
+                continue
+            w(f"- `{o['entity']}` in `{o['file']}`: " + ("; ".join(f"`{d}`" for d in o["overrides"]) or "_no overrides_"))
     if rep.config_keys:
-        w("\n## `axon.*` configuration keys\n")
+        w("\n## `axon.*` and JPA naming/id configuration keys\n")
         for k, v in rep.config_keys.items():
             w(f"- `{k}` — {ex(v)}")
     if rep.dependencies:

@@ -1,5 +1,6 @@
 package com.dc8.axonthin
 
+import com.dc8.axonthin.eventstore.ThinEventStore
 import org.axonframework.common.Registration
 import org.axonframework.eventhandling.EventMessage
 import org.axonframework.eventhandling.GenericEventMessage
@@ -9,13 +10,15 @@ import org.slf4j.LoggerFactory
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * Axon [EventGateway] backed by in-memory, synchronous dispatch — the equivalent of a SimpleEventBus with
- * subscribing event processors. No event store: events are not persisted.
+ * Axon [EventGateway] with synchronous dispatch — the equivalent of Axon's EmbeddedEventStore (or SimpleEventBus when
+ * the store is disabled) with subscribing event processors: events are appended, then handed to event handlers,
+ * in the same transaction.
  */
 class ThinEventGateway internal constructor(
     private val registry: ThinHandlerRegistry,
     private val transactions: ThinTransactions,
     private val errorMode: ThinAxonProperties.EventHandlerErrorMode,
+    private val eventStore: ThinEventStore?,
 ) : EventGateway {
 
     private val log = LoggerFactory.getLogger(ThinEventGateway::class.java)
@@ -44,13 +47,20 @@ class ThinEventGateway internal constructor(
         return Registration { dispatchInterceptors.remove(dispatchInterceptor) }
     }
 
-    /** Dispatches all queued events (including those published by the handlers themselves), in publication order. */
+    /**
+     * Stores, then dispatches all queued events in publication order. Events published by the handlers themselves
+     * are queued and processed in the next round.
+     */
     internal fun flush(uow: ThinUnitOfWork) {
         while (true) {
-            val event = uow.nextPendingEvent() ?: return
-            uow.handling(event) {
-                for (handler in registry.eventHandlers(event.payloadType)) {
-                    invoke(handler, event)
+            val events = uow.drainPendingEvents()
+            if (events.isEmpty()) return
+            eventStore?.append(events)
+            for (event in events) {
+                uow.handling(event) {
+                    for (handler in registry.eventHandlers(event.payloadType)) {
+                        invoke(handler, event)
+                    }
                 }
             }
         }

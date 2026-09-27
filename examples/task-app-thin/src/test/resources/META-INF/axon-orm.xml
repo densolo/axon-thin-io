@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Renames Axon's JPA tables with an "axon_" prefix, the way the real project does it.
+  Overriding <table> replaces Axon's @Table annotation completely, so its unique index on
+  (aggregateIdentifier, sequenceNumber) must be restated here: optimistic concurrency depends on it.
+-->
+<entity-mappings xmlns="https://jakarta.ee/xml/ns/persistence/orm"
+                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                 xsi:schemaLocation="https://jakarta.ee/xml/ns/persistence/orm https://jakarta.ee/xml/ns/persistence/orm/orm_3_1.xsd"
+                 version="3.1">
+    <entity class="org.axonframework.eventsourcing.eventstore.jpa.DomainEventEntry">
+        <table name="axon_domain_event_entry">
+            <index name="axon_domain_event_entry_aggregate_seq" column-list="aggregateIdentifier,sequenceNumber" unique="true"/>
+        </table>
+    </entity>
+    <entity class="org.axonframework.eventsourcing.eventstore.jpa.SnapshotEventEntry">
+        <table name="axon_snapshot_event_entry"/>
+    </entity>
+    <entity class="org.axonframework.eventhandling.tokenstore.jpa.TokenEntry">
+        <table name="axon_token_entry"/>
+    </entity>
+</entity-mappings>

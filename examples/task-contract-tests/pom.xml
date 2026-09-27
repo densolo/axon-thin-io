@@ -22,7 +22,7 @@
         </dependency>
         <dependency>
             <groupId>org.axonframework</groupId>
-            <artifactId>axon-messaging</artifactId>
+            <artifactId>axon-spring</artifactId>
             <scope>provided</scope>
         </dependency>
         <dependency>
