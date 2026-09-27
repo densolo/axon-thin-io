@@ -11,6 +11,12 @@ class ThinAxonProperties {
      */
     var eventHandlerErrorMode: EventHandlerErrorMode = EventHandlerErrorMode.LOG
 
+    /**
+     * Default re-runs of a chunk (`sendAndWait` / `sendAllAndWait` without options) on ConcurrencyException;
+     * per call via `BulkOptions(concurrencyRetries = …)`.
+     */
+    var concurrencyRetries: Int = 0
+
     val eventStore = EventStore()
 
     enum class EventHandlerErrorMode { LOG, PROPAGATE }
@@ -25,12 +31,16 @@ class ThinAxonProperties {
 
         var domainEventTable: String = "domain_event_entry"
 
+        var snapshotEventTable: String = "snapshot_event_entry"
+
         /** Also store events published via EventGateway (not applied by an aggregate), as Axon's event store does. */
         var storeNonAggregateEvents: Boolean = true
 
         val globalIndex = GlobalIndex()
 
         val domainEventTableName: String get() = tablePrefix + domainEventTable
+
+        val snapshotEventTableName: String get() = tablePrefix + snapshotEventTable
     }
 
     class GlobalIndex {

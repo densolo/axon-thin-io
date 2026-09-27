@@ -1,10 +1,12 @@
 package com.dc8.axonthin
 
+import com.dc8.axonthin.aggregate.ThinSnapshotter
 import com.dc8.axonthin.eventstore.GlobalIndexAllocator
 import com.dc8.axonthin.eventstore.PooledSequenceAllocator
 import com.dc8.axonthin.eventstore.ThinEventStore
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.axonframework.commandhandling.gateway.CommandGateway
+import org.axonframework.eventsourcing.Snapshotter
 import org.axonframework.serialization.AnnotationRevisionResolver
 import org.axonframework.serialization.ChainingConverter
 import org.axonframework.serialization.Serializer
@@ -71,8 +73,21 @@ class ThinAxonAutoConfiguration {
                 jdbc, dataSource, config.globalIndex.sequenceName ?: "${config.domainEventTableName}_seq", config.globalIndex.allocationSize,
             )
         }
-        return ThinEventStore(jdbc, serializer, config.domainEventTableName, allocator, config.storeNonAggregateEvents)
+        return ThinEventStore(
+            jdbc, serializer, config.domainEventTableName, config.snapshotEventTableName, allocator,
+            config.storeNonAggregateEvents,
+        )
     }
+
+    /** Target of the application's `SnapshotTriggerDefinition` beans (they take a `Snapshotter`). */
+    @Bean
+    @ConditionalOnBean(ThinEventStore::class)
+    @ConditionalOnMissingBean(Snapshotter::class)
+    fun thinSnapshotter(
+        registry: ThinHandlerRegistry,
+        eventStore: ThinEventStore,
+        transactionManager: ObjectProvider<PlatformTransactionManager>,
+    ): ThinSnapshotter = ThinSnapshotter(registry, eventStore, transactionManager.ifAvailable)
 
     @Bean
     fun thinEventGateway(
@@ -94,6 +109,12 @@ class ThinAxonAutoConfiguration {
         eventGateway: ThinEventGateway,
         transactionManager: ObjectProvider<PlatformTransactionManager>,
         eventStore: ObjectProvider<ThinEventStore>,
-    ): ThinCommandGateway =
-        ThinCommandGateway(registry, eventGateway, ThinTransactions(transactionManager.ifAvailable), eventStore.ifAvailable)
+        properties: ThinAxonProperties,
+    ): ThinCommandGateway = ThinCommandGateway(
+        registry,
+        eventGateway,
+        ThinTransactions(transactionManager.ifAvailable),
+        eventStore.ifAvailable,
+        properties.concurrencyRetries,
+    )
 }

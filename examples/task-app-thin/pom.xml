@@ -33,5 +33,12 @@
             <artifactId>task-contract-tests</artifactId>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <!-- counts the SQL a chunk sends (ThinChunkPipelineTest) -->
+            <groupId>net.ttddyy</groupId>
+            <artifactId>datasource-proxy</artifactId>
+            <version>1.11.0</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 </project>

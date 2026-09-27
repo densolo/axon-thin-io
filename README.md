@@ -59,7 +59,44 @@ scripts/axon-usage-scan  inventory of Axon usage in a real project (see its READ
 | event-handler exception | `PropagatingErrorHandler` configured | `axon.thin.event-handler-error-mode=propagate` (default `log`, like Axon) |
 | correlation metadata | `MessageOriginProvider` (`correlationId`, `traceId`) | same |
 | handler parameters | payload, `Message` types, `MetaData`, `@MetaDataValue`, `@MessageIdentifier`, `@Timestamp`, `@SequenceNumber`, `@SourceId`, `@AggregateType`, Spring beans | same |
-| `sendAllAndWait` | adapter: one transaction around sequential `sendAndWait` | native: one transaction, one unit of work per command, aggregates loaded once per batch |
+| `sendAllAndWait` | adapter: one transaction around sequential `sendAndWait` | one transaction; set-based chunk pipeline (see below) |
+
+### Chunks: set-based `sendAllAndWait` (thin only)
+
+Every top-level dispatch is a *chunk*: `sendAndWait` is a chunk of one, `sendAllAndWait(commands)` a chunk of N.
+A chunk runs in one transaction:
+
+| Stage | Round trips |
+|---|---|
+| preload: latest snapshots of all target aggregates | 1 |
+| preload: events after each snapshot (`join (values (id, after_seq), …)`) | 1 |
+| handle commands in order against the in-memory aggregates | 0 |
+| allocate `global_index` values for all events | 1 (one `nextval` per 50 events, in one query) |
+| append all events (one JDBC batch) | 1 |
+| event handlers: batch handlers get one ordered list | depends on the projection |
+
+`ThinChunkPipelineTest` asserts these counts.
+
+What that means for your code:
+- **Aggregates:** a later command in the chunk sees the aggregate state produced by earlier ones, because they
+  share the in-memory instances.
+- **Projections** receive the chunk's events only after its last command. **Validation inside a chunk** must
+  therefore consider the chunk's own changes, not only the projections.
+- **Batch handlers:** `@EventHandler fun on(events: List<EventMessage<ContainerEvent>>)` (or `List<ContainerEvent>`)
+  receives every event it handles, in publication order, once per chunk. Existing single-event handlers are called
+  once per event. Each handler bean receives the whole chunk before the next bean does.
+- **All-or-nothing:** the first failure rolls the chunk back. Jobs size their chunks (for example 100–500).
+- **Concurrent writers:** if another writer appended to one of the chunk's aggregates first, the unique index
+  raises `ConcurrencyException`. `BulkOptions(concurrencyRetries = n)` (or `axon.thin.concurrency-retries`) re-runs
+  the chunk with freshly loaded aggregates, so your deltas land on the latest state. There is no retry inside a
+  caller's transaction, and no retry on `AggregateStreamCreationException`.
+
+On Axon 4 (the v4 adapter), a chunk runs command by command. Storage and single-command behaviour stay covered by the
+shared contract suite; chunk semantics are thin-only.
+
+Read-model writes from JPA projections are only batched if Hibernate is told to:
+`spring.jpa.properties.hibernate.jdbc.batch_size`, `order_inserts` and `order_updates`, plus `reWriteBatchedInserts=true`
+on the PostgreSQL URL.
 
 ### Storage compatibility
 
@@ -90,6 +127,39 @@ axon.thin:
 
 If the tables don't exist yet, reference DDL is in `axon-thin/src/main/resources/axon-thin/schema/` (H2 and PostgreSQL).
 
+### Snapshots
+
+Thin uses your existing Axon snapshot configuration unchanged:
+
+```kotlin
+@Aggregate(snapshotTriggerDefinition = "taskSnapshotTrigger")
+class Task { ... }
+
+@Bean
+fun taskSnapshotTrigger(snapshotter: Snapshotter) = EventCountSnapshotTriggerDefinition(snapshotter, 100)
+```
+
+The trigger is Axon's own class, so it counts exactly as Axon does: every event handled while loading, the snapshot
+message included, plus every event applied. Thin supplies the `Snapshotter` bean (`ThinSnapshotter`) in place of
+Axon's `SpringAggregateSnapshotter`. It works like Axon's `AbstractSnapshotter` with the default direct executor:
+- it runs after the command's transaction commits, in its own transaction;
+- it rebuilds the aggregate from the store, and only stores the snapshot if it replaces more than one event;
+- it replaces older snapshots of the same aggregate;
+- the snapshot carries the triggering command's `correlationId`/`traceId`.
+
+On load, thin reads the latest snapshot plus the events after it, as Axon's `AbstractEventStore` does. Snapshots
+serialize the aggregate itself with the event serializer (Jackson), so aggregate state must be visible to Jackson.
+The example uses `@JsonAutoDetect(fieldVisibility = ANY)`.
+
+Verified on both engines: the same snapshot points (threshold 5 gives snapshots at seq 4, then seq 8), the same rows,
+and restore after the history is purged. `AxonStorageInteropTest` checks that Axon reads thin's snapshots and that
+thin restores from Axon's.
+
+**One deliberate difference.** If a snapshot can't be read (its class is gone, or the payload is malformed), thin
+skips it and replays the full stream. Axon 4.13 fails the command instead (`IncompatibleAggregateException` /
+`SerializationException`), because it deserializes the payload lazily, after its own fallback has already run.
+`ThinSnapshotFallbackTest` covers thin's behaviour.
+
 ### Processing groups
 
 Thin accepts `@ProcessingGroup` and ignores it: every event handler bean receives every event, as one subscribing
@@ -111,7 +181,7 @@ The transaction gives atomicity. Thin still keeps a small internal scope per com
 
 - **Aggregates:** `@AggregateMember` entities, `AggregateLifecycle.createNew`, `@TargetAggregateVersion`, and
   state-stored (JPA) aggregates.
-- **Snapshots:** they are ignored, and loads replay the full stream.
+- **Snapshots:** `@Aggregate(snapshotFilter)` is ignored.
 - **Upcasters.**
 - **Other Axon features:** sagas, deadlines, queries, handler interceptors, `UnitOfWork` parameters, custom
   correlation providers, and tracking processors.
@@ -124,7 +194,7 @@ overrides.
 ## Build & test
 
 ```bash
-mvn install                               # everything: engine unit tests, the 29-test contract suite on both engines, interop tests
+mvn install                               # everything: engine unit tests, the 33-test contract suite on both engines, interop and thin-only tests
 mvn test -pl examples/task-app-axon4      # contract suite on Axon 4
 mvn test -pl examples/task-app-thin       # contract suite on axon-thin
 ```

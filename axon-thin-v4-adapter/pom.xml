@@ -21,7 +21,7 @@
         </dependency>
         <dependency>
             <groupId>org.axonframework</groupId>
-            <artifactId>axon-messaging</artifactId>
+            <artifactId>axon-modelling</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>

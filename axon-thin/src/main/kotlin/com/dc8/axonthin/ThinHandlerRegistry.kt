@@ -42,7 +42,6 @@ class ThinHandlerRegistry : SmartInitializingSingleton, BeanFactoryAware {
     private lateinit var beanFactory: ConfigurableListableBeanFactory
     private val commandRoutes = HashMap<String, CommandRoute>()
     private val eventHandlerBeans = ArrayList<EventHandlingBean>()
-    private val eventRoutes = ConcurrentHashMap<Class<*>, List<HandlerMethod>>()
     private val aggregates = ArrayList<AggregateModel>()
 
     override fun setBeanFactory(beanFactory: BeanFactory) {
@@ -85,9 +84,10 @@ class ThinHandlerRegistry : SmartInitializingSingleton, BeanFactoryAware {
 
     internal val hasAggregates: Boolean get() = aggregates.isNotEmpty()
 
-    /** All event handlers for [payloadType]: at most one (the most specific) per bean, in bean order. */
-    internal fun eventHandlers(payloadType: Class<*>): List<HandlerMethod> =
-        eventRoutes.computeIfAbsent(payloadType) { type -> eventHandlerBeans.mapNotNull { it.mostSpecific(type) } }
+    internal fun aggregateModel(type: Class<*>): AggregateModel? = aggregates.firstOrNull { it.rootType == type }
+
+    /** Beans with event handlers, in `@Order` order. */
+    internal val eventHandlingBeans: List<EventHandlingBean> get() = eventHandlerBeans
 
     private fun registerAggregate(model: AggregateModel) {
         aggregates += model
@@ -109,7 +109,17 @@ class ThinHandlerRegistry : SmartInitializingSingleton, BeanFactoryAware {
         ReflectionUtils.getUniqueDeclaredMethods(type) { !it.isBridge && !it.isSynthetic }
             .filter { AnnotatedElementUtils.hasAnnotation(it, annotation) }
 
-    private class EventHandlingBean(val bean: Any, val handlers: List<HandlerMethod>) {
-        fun mostSpecific(payloadType: Class<*>): HandlerMethod? = HandlerMethod.mostSpecific(handlers, payloadType)
+    /** A bean's event handlers; per payload type the most specific one (single or batch) is used. */
+    internal class EventHandlingBean(val bean: Any, private val handlers: List<HandlerMethod>) {
+        private val routes = ConcurrentHashMap<Class<*>, Any>()
+
+        fun handlerFor(payloadType: Class<*>): HandlerMethod? =
+            routes.computeIfAbsent(payloadType) { HandlerMethod.mostSpecific(handlers, it) ?: NONE } as? HandlerMethod
+
+        override fun toString(): String = bean.javaClass.simpleName
+    }
+
+    private companion object {
+        val NONE = Any()
     }
 }

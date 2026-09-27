@@ -2,7 +2,11 @@ package com.dc8.axonthin.aggregate
 
 import com.dc8.axonthin.HandlerMethod
 import org.axonframework.commandhandling.CommandHandler
+import org.axonframework.eventhandling.DomainEventMessage
 import org.axonframework.eventhandling.EventHandler
+import org.axonframework.eventsourcing.NoSnapshotTriggerDefinition
+import org.axonframework.eventsourcing.SnapshotTrigger
+import org.axonframework.eventsourcing.SnapshotTriggerDefinition
 import org.axonframework.modelling.command.AggregateCreationPolicy
 import org.axonframework.modelling.command.AggregateIdentifier
 import org.axonframework.modelling.command.AggregateRoot
@@ -24,7 +28,8 @@ import java.util.concurrent.ConcurrentHashMap
  * and methods, `@CreationPolicy`, `@EventSourcingHandler` (any `@EventHandler` inside the aggregate),
  * `AggregateLifecycle.apply / isLive / getVersion / markDeleted`.
  * Like Axon's event-sourced aggregates, a `@AggregateVersion` field is never written (use `getVersion()`).
- * Not (yet): `@AggregateMember` entities, `AggregateLifecycle.createNew`, snapshots, polymorphic aggregates.
+ * Snapshots: `@Aggregate(snapshotTriggerDefinition = ...)` with Axon's own trigger definitions (e.g. EventCount).
+ * Not (yet): `@AggregateMember` entities, `AggregateLifecycle.createNew`, polymorphic aggregates.
  */
 internal class AggregateModel(
     val rootType: Class<*>,
@@ -32,7 +37,27 @@ internal class AggregateModel(
     private val beanFactory: BeanFactory,
 ) {
     /** Aggregate type as stored in the `type` column: `@Aggregate(type = ...)` or the simple class name. */
-    val typeName: String = declaredType(rootType) ?: rootType.simpleName
+    val typeName: String = annotationAttribute(rootType, "type") ?: rootType.simpleName
+
+    /** `@Aggregate(snapshotTriggerDefinition = "beanName")`, resolved lazily (the bean depends on the Snapshotter). */
+    private val snapshotTriggerDefinition: SnapshotTriggerDefinition by lazy {
+        annotationAttribute(rootType, "snapshotTriggerDefinition")
+            ?.let { beanFactory.getBean(it, SnapshotTriggerDefinition::class.java) }
+            ?: NoSnapshotTriggerDefinition.INSTANCE
+    }
+
+    /** A fresh trigger per loaded/created instance, exactly as Axon's EventSourcingRepository does. */
+    fun newSnapshotTrigger(): SnapshotTrigger = snapshotTriggerDefinition.prepareTrigger(rootType)
+
+    /**
+     * Rebuilds an aggregate from a stream that may start with a snapshot (whose payload is the aggregate itself —
+     * Axon's GenericAggregateFactory uses it as the root instead of a new instance).
+     */
+    fun rebuild(stream: List<DomainEventMessage<*>>, trigger: SnapshotTrigger): ThinAggregate {
+        val first = stream.first().payload
+        val root = if (rootType.isInstance(first)) first else newInstance()
+        return ThinAggregate(this, root, trigger).also { it.initializeState(stream) }
+    }
 
     private val identifierMember: Member = findMember(AggregateIdentifier::class.java)
         ?: throw IllegalStateException("Aggregate ${rootType.name} has no @AggregateIdentifier field or method")
@@ -110,11 +135,11 @@ internal class AggregateModel(
 
         fun isAggregate(type: Class<*>): Boolean = AnnotatedElementUtils.hasAnnotation(type, AggregateRoot::class.java)
 
-        /** `type` attribute of @Aggregate / @AggregateRoot (no @AliasFor in Axon, so read it directly). */
-        private fun declaredType(type: Class<*>): String? =
+        /** Attribute of @Aggregate / @AggregateRoot (Axon uses no @AliasFor, so read it directly); empty → null. */
+        private fun annotationAttribute(type: Class<*>, name: String): String? =
             type.annotations.asSequence()
                 .filter { it is AggregateRoot || it.annotationClass.java.isAnnotationPresent(AggregateRoot::class.java) }
-                .mapNotNull { ann -> runCatching { ann.annotationClass.java.getMethod("type").invoke(ann) as String }.getOrNull() }
+                .mapNotNull { ann -> runCatching { ann.annotationClass.java.getMethod(name).invoke(ann) as String }.getOrNull() }
                 .firstOrNull { it.isNotEmpty() }
     }
 }

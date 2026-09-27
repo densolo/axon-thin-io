@@ -75,15 +75,16 @@ class ThinEngineTest {
         .withBean(SecondListener::class.java)
 
     @Test
-    fun `events of nested commands are dispatched after the root handler, in publication order`() {
+    fun `events of nested commands are dispatched after the root handler, bean by bean in publication order`() {
         withHandlers().run { ctx ->
             val result: String = ctx.getBean(CommandGateway::class.java).sendAndWait(Ping("a"))
 
             assertThat(result).isEqualTo("pong:a")
             assertThat(ctx.getBean(Recorder::class.java).seen).containsExactly(
                 "nested-command:a",
-                "first:a:true", "second:a",
-                "first:nested-a:true", "second:nested-a",
+                // each bean receives the whole chunk (in publication order) before the next bean
+                "first:a:true", "first:nested-a:true",
+                "second:a", "second:nested-a",
             )
         }
     }

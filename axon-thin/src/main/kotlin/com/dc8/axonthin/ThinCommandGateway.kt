@@ -1,6 +1,9 @@
 package com.dc8.axonthin
 
+import com.dc8.axonthin.aggregate.AggregateModel
+import com.dc8.axonthin.aggregate.readAggregateStreams
 import com.dc8.axonthin.api.BulkCommandGateway
+import com.dc8.axonthin.api.BulkOptions
 import com.dc8.axonthin.eventstore.ThinEventStore
 import org.axonframework.commandhandling.CommandCallback
 import org.axonframework.commandhandling.CommandMessage
@@ -11,6 +14,9 @@ import org.axonframework.commandhandling.NoHandlerForCommandException
 import org.axonframework.commandhandling.gateway.CommandGateway
 import org.axonframework.common.Registration
 import org.axonframework.messaging.MessageDispatchInterceptor
+import org.axonframework.modelling.command.ConcurrencyException
+import org.slf4j.LoggerFactory
+import org.springframework.transaction.support.TransactionSynchronizationManager
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
@@ -19,6 +25,13 @@ import java.util.concurrent.TimeUnit
  * Axon [CommandGateway] that handles commands synchronously on the calling thread (like SimpleCommandBus),
  * each inside a Spring transaction together with the event handlers of the events it publishes.
  *
+ * Every top-level dispatch is a *chunk* (`sendAndWait` = chunk of one, `sendAllAndWait` = chunk of N):
+ * 1. preload: snapshots + events of all target aggregates, two queries;
+ * 2. handle the commands in order against the in-memory aggregates, collecting their events;
+ * 3. append all events in one batch, then hand them to event handlers (batch handlers get one list);
+ * 4. commit — all or nothing. Optionally re-run on ConcurrencyException ([BulkOptions.concurrencyRetries]).
+ * Commands dispatched from inside a handler join the running chunk.
+ *
  * `send(...)` variants return already-completed futures; timeouts are accepted but have nothing to wait for.
  */
 class ThinCommandGateway internal constructor(
@@ -26,7 +39,10 @@ class ThinCommandGateway internal constructor(
     private val eventGateway: ThinEventGateway,
     private val transactions: ThinTransactions,
     private val eventStore: ThinEventStore?,
+    private val defaultConcurrencyRetries: Int = 0,
 ) : CommandGateway, BulkCommandGateway {
+
+    private val log = LoggerFactory.getLogger(ThinCommandGateway::class.java)
 
     private val dispatchInterceptors = CopyOnWriteArrayList<MessageDispatchInterceptor<in CommandMessage<*>>>()
 
@@ -36,7 +52,7 @@ class ThinCommandGateway internal constructor(
         val typed = message as CommandMessage<C>
         val result: CommandResultMessage<R> = try {
             @Suppress("UNCHECKED_CAST")
-            GenericCommandResultMessage(dispatch(message) as R)
+            GenericCommandResultMessage(execute(listOf(message), defaultConcurrencyRetries).single() as R)
         } catch (e: RuntimeException) {
             GenericCommandResultMessage.asCommandResultMessage(e)
         }
@@ -44,7 +60,8 @@ class ThinCommandGateway internal constructor(
     }
 
     @Suppress("UNCHECKED_CAST")
-    override fun <R : Any?> sendAndWait(command: Any): R = dispatch(prepare(command)) as R
+    override fun <R : Any?> sendAndWait(command: Any): R =
+        execute(listOf(prepare(command)), defaultConcurrencyRetries).single() as R
 
     override fun <R : Any?> sendAndWait(command: Any, timeout: Long, unit: TimeUnit): R = sendAndWait(command)
 
@@ -55,14 +72,8 @@ class ThinCommandGateway internal constructor(
             CompletableFuture.failedFuture(e)
         }
 
-    /**
-     * One transaction for the whole batch. Each command still gets its own unit of work (its events are stored and
-     * dispatched before the next command runs), but aggregates are loaded once and reused across the batch.
-     */
-    override fun sendAllAndWait(commands: List<Any>): List<Any?> {
-        val messages = commands.map(::prepare)
-        return transactions.inTransaction { ThinUnitOfWork.inBatch { messages.map(::dispatch) } }
-    }
+    override fun sendAllAndWait(commands: List<Any>, options: BulkOptions): List<Any?> =
+        execute(commands.map(::prepare), options.concurrencyRetries)
 
     override fun registerDispatchInterceptor(
         dispatchInterceptor: MessageDispatchInterceptor<in CommandMessage<*>>,
@@ -80,21 +91,59 @@ class ThinCommandGateway internal constructor(
         }
     }
 
-    private fun dispatch(command: CommandMessage<*>): Any? {
+    /**
+     * Runs [commands] as one chunk (or inside the running one, when called from a handler). A chunk that owns its
+     * transaction is re-run up to [retries] times on ConcurrencyException, with freshly loaded aggregates.
+     */
+    private fun execute(commands: List<CommandMessage<*>>, retries: Int): List<Any?> {
+        if (ThinUnitOfWork.currentOrNull() != null) return ThinUnitOfWork.joinOrStart { uow, _ -> commands.map { handle(it, uow) } }
+        val ownsTransaction = !TransactionSynchronizationManager.isActualTransactionActive()
+        var attempt = 0
+        while (true) {
+            try {
+                return transactions.inTransaction { ThinUnitOfWork.joinOrStart { uow, _ -> runChunk(commands, uow) } }
+            } catch (e: ConcurrencyException) {
+                // AggregateStreamCreationException is not a ConcurrencyException: a duplicate create is not retried
+                if (!ownsTransaction || attempt >= retries) throw e
+                attempt++
+                log.info("Chunk of {} command(s) conflicted with another writer ({}); retry {}/{}", commands.size, e.message, attempt, retries)
+            }
+        }
+    }
+
+    private fun runChunk(commands: List<CommandMessage<*>>, uow: ThinUnitOfWork): List<Any?> {
+        preload(commands, uow)
+        val results = commands.map { handle(it, uow) }
+        eventGateway.flush(uow)
+        return results
+    }
+
+    /** Loads every aggregate the chunk targets in two queries (snapshots, then events after them). */
+    private fun preload(commands: List<CommandMessage<*>>, uow: ThinUnitOfWork) {
+        val targets = LinkedHashMap<String, AggregateModel>()
+        for (command in commands) {
+            val handler = (registry.commandRoute(command.commandName) as? CommandRoute.Aggregate)?.handler ?: continue
+            val id = handler.preloadTarget(command) ?: continue
+            if ((handler.model.typeName to id) !in uow.aggregates) targets[id] = handler.model
+        }
+        if (targets.isEmpty()) return
+        val streams = requireEventStore().readAggregateStreams(targets)
+        for ((id, model) in targets) {
+            val stream = streams.getValue(id)
+            if (stream.isEmpty()) uow.missing += model.typeName to id
+            else uow.aggregates[model.typeName to id] = model.rebuild(stream, model.newSnapshotTrigger())
+        }
+    }
+
+    private fun handle(command: CommandMessage<*>, uow: ThinUnitOfWork): Any? {
         val route = registry.commandRoute(command.commandName)
             ?: throw NoHandlerForCommandException(
                 "No handler was subscribed for command [${command.commandName}].",
             )
-        return ThinUnitOfWork.joinOrStart { uow, isRoot ->
-            transactions.inTransaction {
-                val result = uow.handling(command) {
-                    when (route) {
-                        is CommandRoute.Bean -> route.handler.invoke(command)
-                        is CommandRoute.Aggregate -> route.handler.handle(command, uow, requireEventStore())
-                    }
-                }
-                if (isRoot) eventGateway.flush(uow)
-                result
+        return uow.handling(command) {
+            when (route) {
+                is CommandRoute.Bean -> route.handler.invoke(command)
+                is CommandRoute.Aggregate -> route.handler.handle(command, uow, requireEventStore())
             }
         }
     }

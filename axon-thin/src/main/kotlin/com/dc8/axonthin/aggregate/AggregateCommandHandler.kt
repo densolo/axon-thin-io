@@ -22,12 +22,20 @@ import java.util.concurrent.ConcurrentHashMap
  * - CREATE_IF_MISSING → load, or new instance when absent; result = method result.
  */
 internal class AggregateCommandHandler(
-    private val model: AggregateModel,
+    val model: AggregateModel,
     val commandName: String,
     private val handler: HandlerMethod,
     private val policy: AggregateCreationPolicy,
     private val isConstructor: Boolean,
 ) {
+    /**
+     * The aggregate this command will load, so a chunk can preload all of them at once; `null` for handlers that
+     * always create (constructors, ALWAYS) or commands without a target identifier.
+     */
+    fun preloadTarget(command: CommandMessage<*>): String? =
+        if (isConstructor || policy == AggregateCreationPolicy.ALWAYS) null
+        else runCatching { targetIdentifier(command, required = false) }.getOrNull()
+
     fun handle(command: CommandMessage<*>, uow: ThinUnitOfWork, store: ThinEventStore): Any? = when {
         isConstructor -> {
             val aggregate = ThinAggregate(model, null)
@@ -52,19 +60,19 @@ internal class AggregateCommandHandler(
     private fun invoke(aggregate: ThinAggregate, command: CommandMessage<*>): Any? =
         aggregate.inScope { handler.invokeOn(aggregate.root!!, command) }
 
-    /** Identity map first (per command, or per batch), then the event store. */
+    /**
+     * Identity map first (preloaded for the chunk, or loaded earlier), then the event store (latest snapshot + later
+     * events) — only for aggregates the chunk could not preload, e.g. targets of nested commands.
+     */
     private fun load(id: String, uow: ThinUnitOfWork, store: ThinEventStore, required: Boolean): ThinAggregate? {
         val key = model.typeName to id
         val aggregate = uow.aggregates[key] ?: run {
-            val events = store.readEvents(id)
-            if (events.isEmpty()) {
+            val stream = if (key in uow.missing) emptyList() else store.readAggregateStream(model, id)
+            if (stream.isEmpty()) {
                 if (required) throw AggregateNotFoundException(id, "The aggregate was not found in the event store")
                 return null
             }
-            ThinAggregate(model, model.newInstance()).also {
-                it.initializeState(events)
-                uow.aggregates[key] = it
-            }
+            model.rebuild(stream, model.newSnapshotTrigger()).also { uow.aggregates[key] = it }
         }
         if (aggregate.deleted) throw AggregateDeletedException(id)
         return aggregate

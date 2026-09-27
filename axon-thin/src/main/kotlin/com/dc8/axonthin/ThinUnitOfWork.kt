@@ -10,15 +10,19 @@ import org.axonframework.messaging.Message
  *
  * - **deferred events**: events published while a command is handled are stored and dispatched to event handlers
  *   only after the root handler returned — Axon's prepare-commit moment — still inside the transaction;
- * - **aggregate identity map**: an aggregate is loaded once and shared by nested commands, so sequence numbers
- *   stay consistent. Inside `sendAllAndWait` the map spans the whole batch (see [inBatch]);
+ * - **aggregate identity map**: an aggregate is loaded once and shared by all commands of the chunk (and nested
+ *   commands), so sequence numbers stay consistent. Chunk targets are preloaded in two queries ([missing] records
+ *   the ones that do not exist, so they are not queried again);
  * - **correlation**: the message being handled is the source of `correlationId`/`traceId` for anything it publishes;
  * - **nested failure isolation**: events queued by a failed nested dispatch are discarded.
  */
-internal class ThinUnitOfWork private constructor(
-    /** Aggregates by (type, id); owned by the batch when running inside `sendAllAndWait`. */
-    val aggregates: MutableMap<Pair<String, String>, ThinAggregate>,
-) {
+internal class ThinUnitOfWork private constructor() {
+
+    /** Aggregates by (type, id), shared by every command of the chunk. */
+    val aggregates = HashMap<Pair<String, String>, ThinAggregate>()
+
+    /** (type, id) preloaded and found absent: loading them again needs no query. */
+    val missing = HashSet<Pair<String, String>>()
 
     private val pendingEvents = ArrayDeque<EventMessage<*>>()
     private val messages = ArrayDeque<Message<*>>()
@@ -49,33 +53,18 @@ internal class ThinUnitOfWork private constructor(
 
     companion object {
         private val current = ThreadLocal<ThinUnitOfWork>()
-        private val batchAggregates = ThreadLocal<MutableMap<Pair<String, String>, ThinAggregate>>()
 
         fun currentOrNull(): ThinUnitOfWork? = current.get()
 
         /** Joins the active unit of work, or starts a root one; [block] receives `true` when it owns the root. */
         fun <T> joinOrStart(block: (uow: ThinUnitOfWork, isRoot: Boolean) -> T): T {
             current.get()?.let { return block(it, false) }
-            val root = ThinUnitOfWork(batchAggregates.get() ?: HashMap())
+            val root = ThinUnitOfWork()
             current.set(root)
             try {
                 return block(root, true)
             } finally {
                 current.remove()
-            }
-        }
-
-        /**
-         * Shares one aggregate identity map between all root units of work started by [block]: a batch loads each
-         * aggregate once. Safe because the batch is one transaction — any failure rolls everything back.
-         */
-        fun <T> inBatch(block: () -> T): T {
-            if (batchAggregates.get() != null) return block()
-            batchAggregates.set(HashMap())
-            try {
-                return block()
-            } finally {
-                batchAggregates.remove()
             }
         }
     }

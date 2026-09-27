@@ -1,6 +1,7 @@
 package com.dc8.example.task.domain
 
 import com.dc8.example.task.api.AddCommentCommand
+import com.fasterxml.jackson.annotation.JsonAutoDetect
 import com.dc8.example.task.api.AssignTaskCommand
 import com.dc8.example.task.api.ChangeTaskStatusCommand
 import com.dc8.example.task.api.CommentAddedEvent
@@ -31,8 +32,16 @@ import org.axonframework.modelling.command.AggregateVersion
 import org.axonframework.modelling.command.CreationPolicy
 import org.axonframework.spring.stereotype.Aggregate
 
-/** Event-sourced aggregate: state is rebuilt from `domain_event_entry` on every load. */
-@Aggregate
+/**
+ * Event-sourced aggregate: state is rebuilt from `domain_event_entry` on load, starting from the latest snapshot.
+ * Snapshots serialize the aggregate itself with the event serializer (Jackson), hence the field visibility.
+ */
+@Aggregate(snapshotTriggerDefinition = "taskSnapshotTrigger")
+@JsonAutoDetect(
+    fieldVisibility = JsonAutoDetect.Visibility.ANY,
+    getterVisibility = JsonAutoDetect.Visibility.NONE,
+    isGetterVisibility = JsonAutoDetect.Visibility.NONE,
+)
 class Task() {
 
     @AggregateIdentifier

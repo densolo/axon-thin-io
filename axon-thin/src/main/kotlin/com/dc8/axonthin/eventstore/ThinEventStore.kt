@@ -12,6 +12,7 @@ import org.axonframework.eventsourcing.eventstore.EventStoreException
 import org.axonframework.serialization.Serializer
 import org.axonframework.serialization.SimpleSerializedObject
 import org.axonframework.serialization.SimpleSerializedType
+import org.slf4j.LoggerFactory
 import org.springframework.dao.DataAccessException
 import org.springframework.dao.DuplicateKeyException
 import org.springframework.jdbc.core.JdbcTemplate
@@ -41,14 +42,22 @@ class ThinEventStore internal constructor(
     private val jdbc: JdbcTemplate,
     private val serializer: Serializer,
     private val table: String,
+    private val snapshotTable: String,
     private val globalIndex: GlobalIndexAllocator,
     private val storeNonAggregateEvents: Boolean,
 ) {
+    private val log = LoggerFactory.getLogger(ThinEventStore::class.java)
+
     private val metaDataType = SimpleSerializedType(MetaData::class.java.name, null)
 
     private val withIndexSql = "insert into $table (global_index, event_identifier, payload_type, payload_revision, " +
         "payload, meta_data, time_stamp, aggregate_identifier, sequence_number, type) values (?,?,?,?,?,?,?,?,?,?)"
     private val identitySql = "insert into $table (event_identifier, payload_type, payload_revision, " +
+        "payload, meta_data, time_stamp, aggregate_identifier, sequence_number, type) values (?,?,?,?,?,?,?,?,?)"
+    private val columns = "event_identifier, payload_type, payload_revision, payload, meta_data, time_stamp, " +
+        "aggregate_identifier, sequence_number, type"
+    private val snapshotDeleteSql = "delete from $snapshotTable where aggregate_identifier = ? and sequence_number < ?"
+    private val snapshotInsertSql = "insert into $snapshotTable (event_identifier, payload_type, payload_revision, " +
         "payload, meta_data, time_stamp, aggregate_identifier, sequence_number, type) values (?,?,?,?,?,?,?,?,?)"
     private val readSql = "select event_identifier, payload_type, payload_revision, payload, meta_data, time_stamp, " +
         "aggregate_identifier, sequence_number, type from $table where aggregate_identifier = ? " +
@@ -77,16 +86,21 @@ class ThinEventStore internal constructor(
                 event.sequenceNumber,
                 event.type,
             )
-            val index = globalIndex.next()
-            (if (index != null) listOf(index) + values else values).toTypedArray()
+            values
+        }.let { rows ->
+            val indexes = globalIndex.allocate(rows.size) // one round trip for the whole chunk
+            if (indexes == null) rows.map { it.toTypedArray() }
+            else rows.mapIndexed { i, values -> (listOf(indexes[i]) + values).toTypedArray() }
         }
         try {
             jdbc.batchUpdate(if (globalIndex === GlobalIndexAllocator.IDENTITY) identitySql else withIndexSql, rows)
         } catch (e: DuplicateKeyException) {
-            val first = domainEvents.first()
-            val description = "An event for aggregate [${first.aggregateIdentifier}] at sequence " +
-                "[${first.sequenceNumber}] was already inserted"
-            if (first.sequenceNumber == 0L) throw AggregateStreamCreationException(description, e)
+            // a chunk appends many aggregates: blame the one the database names (PG/H2 print the key), else the first
+            val detail = e.mostSpecificCause.message.orEmpty()
+            val failed = domainEvents.firstOrNull { detail.contains(it.aggregateIdentifier) } ?: domainEvents.first()
+            val description = "An event for aggregate [${failed.aggregateIdentifier}] at sequence " +
+                "[${failed.sequenceNumber}] was already inserted"
+            if (failed.sequenceNumber == 0L) throw AggregateStreamCreationException(description, e)
             throw ConcurrencyException(description, e)
         } catch (e: DataAccessException) {
             throw EventStoreException("An event for aggregate [${domainEvents.first().aggregateIdentifier}] could not be stored", e)
@@ -96,21 +110,124 @@ class ThinEventStore internal constructor(
     internal fun readEvents(aggregateIdentifier: String, fromSequence: Long = 0): List<DomainEventMessage<*>> =
         jdbc.query(readSql, { rs, _ -> toMessage(rs) }, aggregateIdentifier, fromSequence)
 
-    private fun toMessage(rs: ResultSet): DomainEventMessage<*> {
-        val payloadBytes = rs.getBytes("payload")
-        val payloadType = SimpleSerializedType(rs.getString("payload_type"), rs.getString("payload_revision"))
-        val metaDataBytes = rs.getBytes("meta_data")
+    /**
+     * Events of many aggregates, each after its own sequence number (e.g. its snapshot), in one query per
+     * [MAX_IDS_PER_QUERY] aggregates: `join (values (?, ?), …) v(aggregate_identifier, after_seq)`.
+     */
+    internal fun readEventsAfter(afterSequence: Map<String, Long>): Map<String, List<DomainEventMessage<*>>> {
+        val result = HashMap<String, MutableList<DomainEventMessage<*>>>()
+        afterSequence.entries.chunked(MAX_IDS_PER_QUERY).forEach { part ->
+            val values = part.joinToString(", ") { "(?, ?)" }
+            val sql = "select ${columns.split(", ").joinToString(", ") { "e.$it" }} from $table e " +
+                "join (values $values) as v(aid, after_seq) " +
+                "on e.aggregate_identifier = v.aid and e.sequence_number > v.after_seq " +
+                "order by e.aggregate_identifier, e.sequence_number"
+            val args = part.flatMap { listOf<Any>(it.key, it.value) }.toTypedArray()
+            jdbc.query(sql, { rs, _ -> toMessage(rs) }, *args)
+                .forEach { result.getOrPut(it.aggregateIdentifier) { ArrayList() } += it }
+        }
+        return result
+    }
+
+    /** Latest readable snapshot of one aggregate. */
+    internal fun readSnapshot(aggregateIdentifier: String): DomainEventMessage<*>? =
+        readSnapshots(listOf(aggregateIdentifier))[aggregateIdentifier]
+
+    /**
+     * Latest snapshot per aggregate that can be deserialized (Axon: AbstractEventStorageEngine.readSnapshot), in one
+     * query per [MAX_IDS_PER_QUERY] aggregates. A snapshot that fails to deserialize is skipped with a warning, so the
+     * aggregate is rebuilt from the full stream (or from an older snapshot).
+     */
+    internal fun readSnapshots(aggregateIdentifiers: Collection<String>): Map<String, DomainEventMessage<*>> {
+        val result = HashMap<String, DomainEventMessage<*>>()
+        aggregateIdentifiers.distinct().chunked(MAX_IDS_PER_QUERY).forEach { part ->
+            val sql = "select $columns from $snapshotTable where aggregate_identifier in " +
+                "(${part.joinToString(", ") { "?" }}) order by aggregate_identifier, sequence_number desc"
+            val rows = jdbc.query(sql, { rs, _ -> SnapshotRow(rs) }, *part.toTypedArray())
+            for (row in rows) {
+                if (row.aggregateIdentifier in result) continue
+                try {
+                    result[row.aggregateIdentifier] = row.toMessage()
+                } catch (e: Exception) {
+                    log.warn("Error reading snapshot for aggregate [{}]. Reconstructing from entire event stream.", row.aggregateIdentifier, e)
+                } catch (e: LinkageError) {
+                    log.warn("Error reading snapshot for aggregate [{}]. Reconstructing from entire event stream.", row.aggregateIdentifier, e)
+                }
+            }
+        }
+        return result
+    }
+
+    /** Axon's JpaEventStorageEngine.storeSnapshot: drop older snapshots of the aggregate, insert the new one. */
+    internal fun storeSnapshot(snapshot: DomainEventMessage<*>) {
+        val payload = snapshot.serializePayload(serializer, ByteArray::class.java)
+        val metaData = snapshot.serializeMetaData(serializer, ByteArray::class.java)
+        try {
+            jdbc.update(snapshotDeleteSql, snapshot.aggregateIdentifier, snapshot.sequenceNumber)
+            jdbc.update(
+                snapshotInsertSql,
+                snapshot.identifier, payload.type.name, payload.type.revision, payload.data, metaData.data,
+                DateTimeUtils.formatInstant(snapshot.timestamp), snapshot.aggregateIdentifier, snapshot.sequenceNumber,
+                snapshot.type,
+            )
+        } catch (e: DuplicateKeyException) {
+            throw ConcurrencyException("A snapshot for aggregate [${snapshot.aggregateIdentifier}] at sequence " +
+                "[${snapshot.sequenceNumber}] was already inserted", e)
+        }
+    }
+
+    /** Raw row, so a snapshot that cannot be deserialized does not break reading the others. */
+    private inner class SnapshotRow(rs: ResultSet) {
+        private val eventIdentifier = rs.getString("event_identifier")
+        private val payloadType = SimpleSerializedType(rs.getString("payload_type"), rs.getString("payload_revision"))
+        private val payload: ByteArray = rs.getBytes("payload")
+        private val metaData: ByteArray? = rs.getBytes("meta_data")
+        private val timeStamp = rs.getString("time_stamp")
+        val aggregateIdentifier: String = rs.getString("aggregate_identifier")
+        private val sequenceNumber = rs.getLong("sequence_number")
+        private val type = rs.getString("type")
+
+        fun toMessage(): DomainEventMessage<*> =
+            message(eventIdentifier, payloadType, payload, metaData, timeStamp, aggregateIdentifier, sequenceNumber, type)
+    }
+
+    private fun toMessage(rs: ResultSet): DomainEventMessage<*> = message(
+        rs.getString("event_identifier"),
+        SimpleSerializedType(rs.getString("payload_type"), rs.getString("payload_revision")),
+        rs.getBytes("payload"),
+        rs.getBytes("meta_data"),
+        rs.getString("time_stamp"),
+        rs.getString("aggregate_identifier"),
+        rs.getLong("sequence_number"),
+        rs.getString("type"),
+    )
+
+    private fun message(
+        eventIdentifier: String,
+        payloadType: SimpleSerializedType,
+        payloadBytes: ByteArray,
+        metaDataBytes: ByteArray?,
+        timeStamp: String,
+        aggregateIdentifier: String,
+        sequenceNumber: Long,
+        type: String?,
+    ): DomainEventMessage<*> {
         val payload: Any = serializer.deserialize(SimpleSerializedObject(payloadBytes, ByteArray::class.java, payloadType))
         val metaData: MetaData = metaDataBytes
             ?.let { serializer.deserialize<ByteArray, MetaData>(SimpleSerializedObject(it, ByteArray::class.java, metaDataType)) }
             ?: MetaData.emptyInstance()
-        val timestamp = DateTimeUtils.parseInstant(rs.getString("time_stamp"))
+        val timestamp = DateTimeUtils.parseInstant(timeStamp)
         return GenericDomainEventMessage(
-            rs.getString("type"),
-            rs.getString("aggregate_identifier"),
-            rs.getLong("sequence_number"),
-            GenericMessage(rs.getString("event_identifier"), payload, metaData),
+            type,
+            aggregateIdentifier,
+            sequenceNumber,
+            GenericMessage(eventIdentifier, payload, metaData),
             Supplier { timestamp },
         )
+    }
+
+    private companion object {
+        /** Keeps statements well below PostgreSQL's 32767 bind parameters. */
+        const val MAX_IDS_PER_QUERY = 1000
     }
 }

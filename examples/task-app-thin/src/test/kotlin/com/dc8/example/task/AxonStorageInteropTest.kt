@@ -4,12 +4,14 @@ import com.dc8.example.task.api.AddCommentCommand
 import com.dc8.example.task.api.AssignTaskCommand
 import com.dc8.example.task.api.CommentAddedEvent
 import com.dc8.example.task.api.CreateTaskCommand
+import com.dc8.example.task.api.DeleteCommentCommand
 import com.dc8.example.task.api.ImportTaskCommand
 import com.dc8.example.task.api.RenameTaskCommand
 import com.dc8.example.task.api.TaskAssignedEvent
 import com.dc8.example.task.api.TaskCreatedEvent
 import com.dc8.example.task.api.TaskRenamedEvent
 import com.dc8.example.task.contract.StoredEvents
+import com.dc8.example.task.domain.Task
 import jakarta.persistence.EntityManager
 import org.assertj.core.api.Assertions.assertThat
 import org.axonframework.commandhandling.GenericCommandMessage
@@ -43,6 +45,7 @@ import kotlin.streams.toList
     properties = [
         "spring.jpa.mapping-resources=META-INF/axon-orm.xml",
         "axon.thin.event-handler-error-mode=log",
+        "task.snapshot-threshold=5",
     ],
 )
 class AxonStorageInteropTest {
@@ -118,6 +121,48 @@ class AxonStorageInteropTest {
             TaskRenamedEvent(taskId, "imported"),
         )
     }
+
+    @Test
+    fun `Axon reads the snapshot written by thin`() {
+        val taskId = id()
+        commandGateway.sendAndWait<String>(CreateTaskCommand(taskId, "r0"))
+        (1..4).forEach { commandGateway.sendAndWait<Any>(RenameTaskCommand(taskId, "r$it")) }
+
+        val snapshot = TransactionTemplate(transactionManager).execute { axon.readSnapshot(taskId).orElseThrow() }!!
+
+        assertThat(snapshot.sequenceNumber).isEqualTo(4L)
+        assertThat(snapshot.type).isEqualTo("Task")
+        assertThat(snapshot.payload).isInstanceOf(Task::class.java)
+        // and Axon's full load path (snapshot + later events) agrees on the stream
+        assertThat(axonReadWithSnapshot(taskId).map { it.sequenceNumber }).containsExactly(4L)
+    }
+
+    @Test
+    fun `thin restores an aggregate from a snapshot written by Axon`() {
+        val taskId = id()
+        commandGateway.sendAndWait<String>(CreateTaskCommand(taskId, "r0"))
+        commandGateway.sendAndWait<String>(AddCommentCommand(taskId, "c1", "ann", "hi"))
+        (1..3).forEach { commandGateway.sendAndWait<Any>(RenameTaskCommand(taskId, "r$it")) } // seq 4 -> snapshot
+        // replace thin's snapshot with one written by Axon's storage engine (Axon's serialization path)
+        TransactionTemplate(transactionManager).executeWithoutResult {
+            val task = axon.readSnapshot(taskId).orElseThrow().payload as Task
+            jdbc.update("delete from axon_snapshot_event_entry where aggregate_identifier = ?", taskId)
+            axon.storeSnapshot(GenericDomainEventMessage("Task", taskId, 4, task))
+        }
+        stored.deleteEventsUpTo(taskId, 4) // history gone: only Axon's snapshot knows the state
+
+        commandGateway.sendAndWait<Any>(RenameTaskCommand(taskId, "r3")) // no-op if the title came from the snapshot
+        commandGateway.sendAndWait<Any>(DeleteCommentCommand(taskId, "c1")) // c1 exists only in the snapshot
+
+        assertThat(stored.forAggregate(taskId).map { it.sequenceNumber to it.payloadType.substringAfterLast('.') })
+            .containsExactly(5L to "CommentDeletedEvent")
+    }
+
+    private fun axonReadWithSnapshot(aggregateId: String): List<DomainEventMessage<*>> =
+        TransactionTemplate(transactionManager).execute {
+            val snapshot = axon.readSnapshot(aggregateId).orElseThrow()
+            listOf(snapshot) + axon.readEvents(aggregateId, snapshot.sequenceNumber + 1).asStream().toList()
+        }!!
 
     @Test
     fun `global index allocation from both engines never collides`() {

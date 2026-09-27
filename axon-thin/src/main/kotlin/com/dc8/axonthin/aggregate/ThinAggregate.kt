@@ -4,6 +4,7 @@ import com.dc8.axonthin.ThinUnitOfWork
 import com.dc8.axonthin.correlationData
 import org.axonframework.eventhandling.DomainEventMessage
 import org.axonframework.eventhandling.GenericDomainEventMessage
+import org.axonframework.eventsourcing.SnapshotTrigger
 import org.axonframework.messaging.MetaData
 import org.axonframework.modelling.command.Aggregate
 import org.axonframework.modelling.command.AggregateLifecycle
@@ -26,6 +27,8 @@ import java.util.function.Supplier
 internal class ThinAggregate(
     val model: AggregateModel,
     root: Any?,
+    /** Axon's SnapshotTrigger: sees every domain event this instance handles (sourced, snapshot included, or applied). */
+    private val snapshotTrigger: SnapshotTrigger = model.newSnapshotTrigger(),
 ) : AggregateLifecycle() {
 
     var root: Any? = root
@@ -49,10 +52,17 @@ internal class ThinAggregate(
     fun initializeState(events: List<DomainEventMessage<*>>) {
         live = false
         try {
-            inScope { events.forEach { event -> lastSequence = event.sequenceNumber; source(event) } }
+            inScope {
+                events.forEach { event ->
+                    lastSequence = event.sequenceNumber
+                    snapshotTrigger.eventHandled(event)
+                    source(event)
+                }
+            }
         } finally {
             live = true
         }
+        snapshotTrigger.initializationFinished()
     }
 
     /** After a creation handler constructed the root: attach it and apply what the constructor applied. */
@@ -120,6 +130,7 @@ internal class ThinAggregate(
         val before = identifierAsString
         var event: DomainEventMessage<*> = GenericDomainEventMessage(model.typeName, before, sequence, payload, correlated)
         lastSequence = sequence // getVersion() inside the sourcing handler already reflects this event (as in Axon)
+        snapshotTrigger.eventHandled(event)
         source(event)
         val after = identifierAsString ?: throw IllegalStateException(
             "Aggregate identifier must be non-null after applying an event. Make sure the aggregate identifier " +

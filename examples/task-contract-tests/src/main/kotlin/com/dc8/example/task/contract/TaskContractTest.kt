@@ -38,6 +38,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.test.context.TestPropertySource
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -50,6 +51,7 @@ import java.util.concurrent.atomic.AtomicReference
  * Engine configuration assumed by the contract: event-sourced aggregates on Axon's `domain_event_entry` layout
  * (tables prefixed `axon_`), Jackson serializer, subscribing event processors, event handler errors propagate.
  */
+@TestPropertySource(properties = ["task.snapshot-threshold=5"])
 abstract class TaskContractTest {
 
     @Autowired lateinit var commandGateway: CommandGateway
@@ -262,6 +264,65 @@ abstract class TaskContractTest {
         assertThat(observed).isEqualTo(PROBE_OBSERVED)
     }
 
+    // ---- snapshots (EventCountSnapshotTriggerDefinition, threshold 5) -----------------------------------------------
+
+    private fun createTaskWithRenames(renames: Int): String {
+        val taskId = createTask("r0")
+        (1..renames).forEach { commandGateway.sendAndWait<Any>(RenameTaskCommand(taskId, "r$it")) }
+        return taskId
+    }
+
+    @Test
+    fun `snapshot is stored once the trigger threshold is reached`() {
+        val taskId = createTaskWithRenames(3)
+        val fifth = GenericCommandMessage.asCommandMessage<RenameTaskCommand>(RenameTaskCommand(taskId, "r4"))
+        commandGateway.sendAndWait<Any>(fifth) // 5 events: seq 0..4
+
+        val snapshots = stored.snapshots(taskId)
+
+        assertThat(snapshots.map { it.sequenceNumber }).containsExactly(SNAPSHOT_AFTER_5_EVENTS)
+        val snapshot = snapshots.single()
+        assertThat(snapshot.type).isEqualTo("Task")
+        assertThat(snapshot.payloadType).isEqualTo("com.dc8.example.task.domain.Task")
+        assertThat(snapshot.payload).containsEntry("taskId", taskId).containsEntry("title", "r4")
+        // built in the unit of work of the command that crossed the threshold
+        assertThat(snapshot.metaData).isEqualTo(mapOf("correlationId" to fifth.identifier, "traceId" to fifth.identifier))
+    }
+
+    @Test
+    fun `newer snapshot replaces the older one`() {
+        val taskId = createTaskWithRenames(11) // 12 events: seq 0..11
+
+        assertThat(stored.snapshots(taskId).map { it.sequenceNumber }).containsExactly(SNAPSHOT_AFTER_12_EVENTS)
+    }
+
+    @Test
+    fun `aggregate is restored from the snapshot`() {
+        val taskId = createTaskWithRenames(4)
+        commandGateway.sendAndWait<String>(AddCommentCommand(taskId, "c0", "ann", "before snapshot"))
+        val snapshotSeq = stored.snapshots(taskId).maxOf { it.sequenceNumber }
+        stored.deleteEventsUpTo(taskId, snapshotSeq) // only the snapshot knows the state now
+
+        commandGateway.sendAndWait<Any>(RenameTaskCommand(taskId, "r4")) // same title: no event if state was restored
+        commandGateway.sendAndWait<Any>(DeleteCommentCommand(taskId, "c0")) // c0 known only via the snapshot/stream
+
+        assertThat(stored.forAggregate(taskId).map { it.payloadType.substringAfterLast('.') })
+            .endsWith("CommentDeletedEvent")
+            .doesNotContain("TaskRenamedEvent")
+    }
+
+    @Test
+    fun `bulk commands on one aggregate leave a usable snapshot`() {
+        val taskId = id()
+
+        bulk.sendAllAndWait(listOf(CreateTaskCommand(taskId, "b0")) + (1..11).map { RenameTaskCommand(taskId, "b$it") })
+
+        assertThat(stored.snapshots(taskId)).hasSize(1)
+        stored.deleteEventsUpTo(taskId, stored.snapshots(taskId).single().sequenceNumber)
+        commandGateway.sendAndWait<Any>(RenameTaskCommand(taskId, "b12"))
+        assertThat(queries.summary(taskId)!!.title).isEqualTo("b12")
+    }
+
     // ---- storage format (what the other engine / other services will read) -----------------------------------------
 
     @Test
@@ -471,6 +532,9 @@ abstract class TaskContractTest {
         // observed on Axon 4.13 (the reference); axon-thin must produce the same
         // 3 events replayed while not live; @AggregateVersion is only read (state-stored), never written for event sourcing
         const val PROBE_OBSERVED = "replayed=3 before=null after=null"
+        // the snapshot message itself counts towards the next threshold: 5 → seq 4, then 1 + 4 events → seq 8
+        const val SNAPSHOT_AFTER_5_EVENTS = 4L
+        const val SNAPSHOT_AFTER_12_EVENTS = 8L
     }
 
     private fun rootCause(e: Throwable): Throwable = generateSequence(e) { it.cause }.last()

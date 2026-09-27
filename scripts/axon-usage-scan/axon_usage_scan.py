@@ -92,8 +92,13 @@ CATALOG: dict[str, tuple[str, str, str]] = {
     "AggregateStreamCreationException": ("aggregates", S, ""),
     "ConcurrencyException": ("aggregates", S, ""),
     "TargetAggregateVersion": ("aggregates", M, "expected-version check"),
-    "SnapshotEventEntry": ("event-store", M, "snapshots are ignored"),
+    "SnapshotEventEntry": ("snapshots", S, "same table/rows; prefix applies"),
     "DomainEventEntry": ("event-store", S, ""),
+    "EventCountSnapshotTriggerDefinition": ("snapshots", S, "Axon's class, used unchanged"),
+    "AggregateLoadTimeSnapshotTriggerDefinition": ("snapshots", S, "Axon's class, used unchanged"),
+    "AggregateSnapshotter": ("snapshots", S, "replaced by ThinSnapshotter"),
+    "SpringAggregateSnapshotter": ("snapshots", S, "replaced by ThinSnapshotter"),
+    "SnapshotFilter": ("snapshots", M, "@Aggregate(snapshotFilter) is ignored"),
     "GenericDomainEventMessage": ("messages", S, ""),
     "CurrentUnitOfWork": ("unit-of-work", M, ""),
     "DefaultUnitOfWork": ("unit-of-work", M, ""),
@@ -114,8 +119,8 @@ CATALOG: dict[str, tuple[str, str, str]] = {
     "EventSourcingRepository": ("aggregates", P, "built in, not exposed"),
     "AggregateNotFoundException": ("aggregates", S, ""),
     "ConflictResolver": ("aggregates", M, ""),
-    "Snapshotter": ("event-store", M, "snapshots are ignored: loads replay all events"),
-    "SnapshotTriggerDefinition": ("event-store", M, "snapshots are ignored: loads replay all events"),
+    "Snapshotter": ("snapshots", S, "ThinSnapshotter bean replaces SpringAggregateSnapshotter; after commit, own transaction"),
+    "SnapshotTriggerDefinition": ("snapshots", S, "your beans are reused as-is via @Aggregate(snapshotTriggerDefinition)"),
     "EventStore": ("event-store", P, "Axon-compatible JDBC store, not exposed as EventStore"),
     "EventStorageEngine": ("event-store", P, "built-in JDBC engine; Axon tables"),
     "JpaEventStorageEngine": ("event-store", S, "same tables/rows; prefix via axon.thin.event-store.table-prefix"),
@@ -672,8 +677,21 @@ def handler_findings(rep: Report) -> list[tuple[str, str, int, list]]:
                 continue
             label = ", ".join("@" + a for a in p["annotations"]) or p["type"]
             findings[f"parameter: {label}"].append(where)
-    return sorted(((k, S if _param_supported(k) else M, len(v), v) for k, v in findings.items()),
+    return sorted(((k, _shape_status(k), len(v), v) for k, v in findings.items()),
                   key=lambda f: (-f[2], f[0]))
+
+
+# handler shapes axon-thin runs today (event-sourced aggregates: command handlers incl. constructors, sourcing handlers)
+SUPPORTED_SHAPES = {
+    "@CommandHandler inside @Aggregate", "@CommandHandler on constructor", "@EventSourcingHandler inside @Aggregate",
+    "@EventHandler inside @Aggregate",
+}
+
+
+def _shape_status(label: str) -> str:
+    if label in SUPPORTED_SHAPES:
+        return S
+    return S if _param_supported(label) else M
 
 
 def _param_supported(label: str) -> bool:
@@ -681,7 +699,8 @@ def _param_supported(label: str) -> bool:
         return False
     p = label[len("parameter: "):]
     if p.startswith("@"):
-        return all(a.strip().lstrip("@") in ("MetaDataValue", "MessageIdentifier", "Timestamp")
+        return all(a.strip().lstrip("@") in ("MetaDataValue", "MessageIdentifier", "Timestamp", "SequenceNumber",
+                                             "SourceId", "AggregateType")
                    for a in p.split(","))
     base = re.sub(r"<.*", "", p).rstrip("?")
     if base in ("UnitOfWork", "InterceptorChain", "ReplayStatus", "ScopeDescriptor", "DeadlineMessage"):
