@@ -2,6 +2,7 @@ package com.dc8.example.task
 
 import com.dc8.example.task.api.CreateTaskCommand
 import com.dc8.example.task.api.RenameTaskCommand
+import com.dc8.example.task.contract.PostgresSupport
 import com.dc8.example.task.contract.StoredEvents
 import com.dc8.example.task.query.TaskQueryService
 import org.assertj.core.api.Assertions.assertThat
@@ -11,6 +12,8 @@ import org.junit.jupiter.params.provider.ValueSource
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.test.context.DynamicPropertyRegistry
+import org.springframework.test.context.DynamicPropertySource
 import java.util.UUID
 
 /**
@@ -39,5 +42,12 @@ class ThinSnapshotFallbackTest {
 
         assertThat(queries.summary(taskId)!!.title).isEqualTo("after corruption")
         assertThat(stored.forAggregate(taskId).last().sequenceNumber).isEqualTo(5L)
+    }
+
+    companion object {
+        /** PostgreSQL database for `-Ppostgres`; no-op on H2. */
+        @JvmStatic
+        @DynamicPropertySource
+        fun database(registry: DynamicPropertyRegistry) = PostgresSupport.register(registry, "snapshot_fallback")
     }
 }

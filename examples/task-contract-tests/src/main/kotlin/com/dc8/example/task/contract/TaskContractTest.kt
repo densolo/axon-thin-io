@@ -38,6 +38,8 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.test.context.DynamicPropertyRegistry
+import org.springframework.test.context.DynamicPropertySource
 import org.springframework.test.context.TestPropertySource
 import java.time.Instant
 import java.util.UUID
@@ -564,6 +566,11 @@ abstract class TaskContractTest {
     data class UnknownCommand(val id: String)
 
     companion object {
+        /** PostgreSQL database for `-Ppostgres`; no-op on H2. */
+        @JvmStatic
+        @DynamicPropertySource
+        fun database(registry: DynamicPropertyRegistry) = PostgresSupport.register(registry, "contract")
+
         // observed on Axon 4.13 (the reference); axon-thin must produce the same
         // 3 events replayed while not live; @AggregateVersion is only read (state-stored), never written for event sourcing
         const val PROBE_OBSERVED = "replayed=3 before=null after=null"

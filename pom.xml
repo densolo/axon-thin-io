@@ -106,6 +106,25 @@
         </dependency>
     </dependencies>
 
+    <profiles>
+        <!-- mvn test -Ppostgres : run the example suites against PostgreSQL in Docker (Testcontainers) -->
+        <profile>
+            <id>postgres</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <systemPropertyVariables>
+                                <thin.test.db>postgres</thin.test.db>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
     <build>
         <sourceDirectory>src/main/kotlin</sourceDirectory>
         <testSourceDirectory>src/test/kotlin</testSourceDirectory>

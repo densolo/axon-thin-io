@@ -214,11 +214,35 @@ overrides.
 ## Build & test
 
 ```bash
-mvn install                               # everything: engine unit tests, the 33-test contract suite on both engines, interop and thin-only tests
-mvn test -pl examples/task-app-axon4      # contract suite on Axon 4
-mvn test -pl examples/task-app-thin       # contract suite on axon-thin
+mvn install                                  # H2: engine unit tests, the contract suite on both engines, thin-only suites
+mvn test -Ppostgres -pl examples/task-app-axon4,examples/task-app-thin   # the same, on PostgreSQL 17 in Docker
+mvn test -Ppostgres -pl examples/task-app-thin -Dtest=PostgresChunkBenchmarkTest   # chunk timings (prints a table)
 ```
 
-JDK 21+ (bytecode target 21), Kotlin 2.4, Spring Boot 3.5, H2. Postgres is planned. The event store uses plain
-JDBC (`nextval(...)` on PostgreSQL, `next value for` elsewhere). Postgres support is mainly a Testcontainers
-profile, plus the `bytea`/`oid` question above.
+**PostgreSQL via Testcontainers (`-Ppostgres`)**
+- Needs Docker (Docker Desktop is fine, including on Apple Silicon: `postgres:17-alpine` is multi-arch).
+- There is one container per test JVM and one database per test class (`PostgresSupport`), so no local setup is needed.
+- If Testcontainers can't find Docker, enable *Docker Desktop → Settings → Advanced → "Allow the default Docker
+  socket to be used"*, or put `docker.host=unix:///Users/<you>/.docker/run/docker.sock` in
+  `~/.testcontainers.properties`.
+- **PostgreSQL-only tests:**
+  - `PostgresConcurrencyTest`: two application contexts ("backend" and "jobs") on one database write to the same
+    aggregates at the same time. It checks for contiguous sequences and read models equal to the last event, and
+    reports `global_index` order inversions.
+  - `PostgresChunkBenchmarkTest`: timings and round trips per chunk.
+- **Axon 4 on PostgreSQL** needs `bytea` payload columns (Hibernate's default for `@Lob byte[]` is `oid`). The tests use
+  `ByteaEnforcedPostgresSQLDialect`, as recommended in Axon's reference guide. Your production mapping must also
+  produce `bytea`.
+
+**Lessons from the PostgreSQL runs**
+- **Event-store round trips per chunk are constant:** 2 for creates, 4 for updates (snapshots, events, index,
+  insert), whatever the chunk size.
+- **Naive projections dominate.** With one `findById`/merge per event, projections cost about one round trip per
+  command, which is 1,040 of 1,044 round trips for 1k commands. Converting a hot projection to a batch handler
+  (`findAllById` + batched writes, `Persistable.isNew` for assigned ids) is the next lever.
+- **Large optimistic chunks can starve under sustained contention on their aggregates.** Retries use exponential
+  backoff with jitter. If jobs keep losing races to users, use smaller chunks.
+- **Pooled `global_index` blocks from two processes are not in commit order** (about 5% inversions in the concurrency
+  test). This only matters if something reads the store by `global_index`.
+
+JDK 21+ (bytecode target 21), Kotlin 2.4, Spring Boot 3.5, H2 and PostgreSQL 17.

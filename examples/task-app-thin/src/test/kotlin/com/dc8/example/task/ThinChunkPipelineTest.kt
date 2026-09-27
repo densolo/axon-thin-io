@@ -9,6 +9,7 @@ import com.dc8.example.task.api.RenameTaskCommand
 import com.dc8.example.task.api.TaskCreatedEvent
 import com.dc8.example.task.api.TaskEvent
 import com.dc8.example.task.api.TaskRenamedEvent
+import com.dc8.example.task.contract.PostgresSupport
 import com.dc8.example.task.contract.StoredEvents
 import com.dc8.example.task.domain.Task
 import com.dc8.example.task.query.TaskQueryService
@@ -35,6 +36,8 @@ import org.springframework.boot.test.context.TestConfiguration
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Import
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.test.context.DynamicPropertyRegistry
+import org.springframework.test.context.DynamicPropertySource
 import org.springframework.transaction.PlatformTransactionManager
 import org.springframework.transaction.TransactionDefinition
 import org.springframework.transaction.support.TransactionTemplate
@@ -83,7 +86,7 @@ class ThinChunkPipelineTest {
     private val eventReads = { sql: String -> sql.startsWith("select") && sql.contains("from axon_domain_event_entry") }
     private val snapshotReads = { sql: String -> sql.startsWith("select") && sql.contains("from axon_snapshot_event_entry") }
     private val eventInserts = { sql: String -> sql.startsWith("insert into axon_domain_event_entry") }
-    private val sequenceFetches = { sql: String -> sql.contains("next value for axon_domain_event_entry_seq") }
+    private val sequenceFetches = { sql: String -> sql.contains("axon_domain_event_entry_seq") } // H2 and PostgreSQL syntax
 
     private fun createTasks(count: Int): List<String> =
         bulk.sendAllAndWait(List(count) { CreateTaskCommand(id(), "t$it") }).map { it as String }
@@ -322,5 +325,12 @@ class ThinChunkPipelineTest {
                         } else bean
                 }
         }
+    }
+
+    companion object {
+        /** PostgreSQL database for `-Ppostgres`; no-op on H2. */
+        @JvmStatic
+        @DynamicPropertySource
+        fun database(registry: DynamicPropertyRegistry) = PostgresSupport.register(registry, "chunk_pipeline")
     }
 }

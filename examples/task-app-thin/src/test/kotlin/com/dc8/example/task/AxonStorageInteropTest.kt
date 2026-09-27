@@ -10,6 +10,7 @@ import com.dc8.example.task.api.RenameTaskCommand
 import com.dc8.example.task.api.TaskAssignedEvent
 import com.dc8.example.task.api.TaskCreatedEvent
 import com.dc8.example.task.api.TaskRenamedEvent
+import com.dc8.example.task.contract.PostgresSupport
 import com.dc8.example.task.contract.StoredEvents
 import com.dc8.example.task.domain.Task
 import jakarta.persistence.EntityManager
@@ -28,6 +29,8 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Qualifier
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.test.context.DynamicPropertyRegistry
+import org.springframework.test.context.DynamicPropertySource
 import org.springframework.transaction.PlatformTransactionManager
 import org.springframework.transaction.support.TransactionTemplate
 import java.util.UUID
@@ -177,5 +180,12 @@ class AxonStorageInteropTest {
         val rows = stored.all()
         assertThat(rows).hasSize(120)
         assertThat(rows.map { it.globalIndex }).doesNotHaveDuplicates().allSatisfy { assertThat(it).isPositive() }
+    }
+
+    companion object {
+        /** PostgreSQL database for `-Ppostgres`; no-op on H2. */
+        @JvmStatic
+        @DynamicPropertySource
+        fun database(registry: DynamicPropertyRegistry) = PostgresSupport.register(registry, "interop")
     }
 }

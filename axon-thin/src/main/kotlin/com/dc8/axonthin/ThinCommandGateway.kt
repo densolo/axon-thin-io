@@ -19,6 +19,7 @@ import org.slf4j.LoggerFactory
 import org.springframework.transaction.support.TransactionSynchronizationManager
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
 
 /**
@@ -106,9 +107,23 @@ class ThinCommandGateway internal constructor(
                 // AggregateStreamCreationException is not a ConcurrencyException: a duplicate create is not retried
                 if (!ownsTransaction || attempt >= retries) throw e
                 attempt++
-                log.info("Chunk of {} command(s) conflicted with another writer ({}); retry {}/{}", commands.size, e.message, attempt, retries)
+                val pause = retryBackoff(attempt)
+                log.info(
+                    "Chunk of {} command(s) conflicted with another writer ({}); retry {}/{} in {} ms",
+                    commands.size, e.message, attempt, retries, pause,
+                )
+                Thread.sleep(pause)
             }
         }
+    }
+
+    /**
+     * Exponential backoff with full jitter (5 ms, 10 ms, 20 ms … capped at 1 s): retrying immediately would collide
+     * with the same writer again; jitter keeps competing chunks from retrying in lockstep.
+     */
+    private fun retryBackoff(attempt: Int): Long {
+        val cap = minOf(1_000L, 5L shl minOf(attempt - 1, 8))
+        return ThreadLocalRandom.current().nextLong(cap / 2, cap + 1)
     }
 
     private fun runChunk(commands: List<CommandMessage<*>>, uow: ThinUnitOfWork): List<Any?> {
