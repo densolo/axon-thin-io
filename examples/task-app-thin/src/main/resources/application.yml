@@ -1,0 +1,11 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:tasks-thin;DB_CLOSE_DELAY=-1
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    open-in-view: false
+axon:
+  thin:
+    # match the Axon 4 app (PropagatingErrorHandler): a failing projection rolls the command back
+    event-handler-error-mode: propagate
