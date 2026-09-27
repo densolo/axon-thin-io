@@ -58,6 +58,12 @@
             <artifactId>spring-jdbc</artifactId>
         </dependency>
         <dependency>
+            <!-- ProjectionMigrator checks projection entities for emptiness; only active when JPA is present -->
+            <groupId>jakarta.persistence</groupId>
+            <artifactId>jakarta.persistence-api</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
             <groupId>org.springframework</groupId>
             <artifactId>spring-tx</artifactId>
         </dependency>

@@ -1,1 +1,2 @@
 com.dc8.axonthin.ThinAxonAutoConfiguration
+com.dc8.axonthin.ThinProjectionMigratorAutoConfiguration

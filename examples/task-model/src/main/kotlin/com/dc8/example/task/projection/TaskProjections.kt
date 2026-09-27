@@ -1,5 +1,6 @@
 package com.dc8.example.task.projection
 
+import com.dc8.axonthin.api.ReplayInto
 import com.dc8.example.task.api.CommentAddedEvent
 import com.dc8.example.task.api.CommentDeletedEvent
 import com.dc8.example.task.api.CommentEditedEvent
@@ -77,11 +78,12 @@ interface TaskActivityRepository : JpaRepository<TaskActivity, Long> {
     fun findByTaskIdOrderById(taskId: String): List<TaskActivity>
 }
 
-// ---- projections (processing groups are declared as in a real app; axon-thin ignores them) --------------------------
+// ---- projections: processing groups as in a real app; @ReplayInto lets thin's ProjectionMigrator refill them ----
 
 /** Denormalized list view, updated in the command's transaction (subscribing processor semantics). */
 @Component
 @ProcessingGroup("task-summary")
+@ReplayInto(TaskSummary::class)
 class TaskSummaryProjection(private val summaries: TaskSummaryRepository) {
 
     @EventHandler
@@ -114,6 +116,7 @@ class TaskSummaryProjection(private val summaries: TaskSummaryRepository) {
 
 @Component
 @ProcessingGroup("task-comments")
+@ReplayInto(CommentView::class)
 class CommentProjection(private val comments: CommentViewRepository) {
 
     @EventHandler
@@ -133,6 +136,7 @@ class CommentProjection(private val comments: CommentViewRepository) {
 /** Audit trail: one supertype handler for every [TaskEvent], using message-level parameter resolvers. */
 @Component
 @ProcessingGroup("task-activity")
+@ReplayInto(TaskActivity::class)
 class TaskActivityProjection(private val activities: TaskActivityRepository) {
 
     @EventHandler

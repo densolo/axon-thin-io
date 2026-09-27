@@ -59,27 +59,45 @@ class ThinEventGateway internal constructor(
             val events = uow.drainPendingEvents()
             if (events.isEmpty()) return
             eventStore?.append(events)
-            for (bean in registry.eventHandlingBeans) {
-                val batches = LinkedHashMap<HandlerMethod, MutableList<EventMessage<*>>>()
-                for (event in events) {
-                    val handler = bean.handlerFor(event.payloadType) ?: continue
-                    if (handler.isBatch) batches.getOrPut(handler) { ArrayList() } += event
-                    else uow.handling(event) { guarded(handler, event.identifier) { handler.invoke(event) } }
-                }
-                for ((handler, batch) in batches) {
-                    uow.handling(batch.last()) {
-                        guarded(handler, "${batch.size} events") { handler.invokeBatch(batch) }
-                    }
+            dispatch(registry.eventHandlingBeans, events, uow, errorMode)
+        }
+    }
+
+    /**
+     * Hands [events] to [beans], bean by bean in order: single-event handlers once per event, batch handlers once with
+     * all events they handle (both in the order of [events]). Shared by live chunks and projection replays.
+     */
+    internal fun dispatch(
+        beans: List<ThinHandlerRegistry.EventHandlingBean>,
+        events: List<EventMessage<*>>,
+        uow: ThinUnitOfWork,
+        mode: ThinAxonProperties.EventHandlerErrorMode,
+    ) {
+        for (bean in beans) {
+            val batches = LinkedHashMap<HandlerMethod, MutableList<EventMessage<*>>>()
+            for (event in events) {
+                val handler = bean.handlerFor(event.payloadType) ?: continue
+                if (handler.isBatch) batches.getOrPut(handler) { ArrayList() } += event
+                else uow.handling(event) { guarded(mode, handler, event.identifier) { handler.invoke(event) } }
+            }
+            for ((handler, batch) in batches) {
+                uow.handling(batch.last()) {
+                    guarded(mode, handler, "${batch.size} events") { handler.invokeBatch(batch) }
                 }
             }
         }
     }
 
-    private inline fun guarded(handler: HandlerMethod, what: String, block: () -> Unit) {
+    private inline fun guarded(
+        mode: ThinAxonProperties.EventHandlerErrorMode,
+        handler: HandlerMethod,
+        what: String,
+        block: () -> Unit,
+    ) {
         try {
             block()
         } catch (e: RuntimeException) {
-            when (errorMode) {
+            when (mode) {
                 ThinAxonProperties.EventHandlerErrorMode.PROPAGATE -> throw e
                 ThinAxonProperties.EventHandlerErrorMode.LOG ->
                     log.error("EventListener [{}] failed to handle event [{}]; continuing", handler, what, e)

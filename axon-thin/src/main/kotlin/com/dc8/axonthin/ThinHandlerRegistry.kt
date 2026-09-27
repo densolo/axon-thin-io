@@ -70,7 +70,7 @@ class ThinHandlerRegistry : SmartInitializingSingleton, BeanFactoryAware {
                     val ann = AnnotatedElementUtils.findMergedAnnotation(method, EventHandler::class.java)!!
                     HandlerMethod.create(method, ann.payloadType.java, beanFactory, bean)
                 }
-                eventHandlerBeans += EventHandlingBean(bean, handlers)
+                eventHandlerBeans += EventHandlingBean(name, bean, handlers)
             }
         }
         eventHandlerBeans.sortWith { a, b -> AnnotationAwareOrderComparator.INSTANCE.compare(a.bean, b.bean) }
@@ -110,11 +110,20 @@ class ThinHandlerRegistry : SmartInitializingSingleton, BeanFactoryAware {
             .filter { AnnotatedElementUtils.hasAnnotation(it, annotation) }
 
     /** A bean's event handlers; per payload type the most specific one (single or batch) is used. */
-    internal class EventHandlingBean(val bean: Any, private val handlers: List<HandlerMethod>) {
+    internal class EventHandlingBean(val beanName: String, val bean: Any, private val handlers: List<HandlerMethod>) {
         private val routes = ConcurrentHashMap<Class<*>, Any>()
 
         fun handlerFor(payloadType: Class<*>): HandlerMethod? =
             routes.computeIfAbsent(payloadType) { HandlerMethod.mostSpecific(handlers, it) ?: NONE } as? HandlerMethod
+
+        /** `@ProcessingGroup` name if present (Axon's projection identity), else the bean name. */
+        val projectionName: String = ClassUtils.getUserClass(bean).annotations
+            .firstOrNull { it.annotationClass.qualifiedName == "org.axonframework.config.ProcessingGroup" }
+            ?.let { runCatching { it.annotationClass.java.getMethod("value").invoke(it) as String }.getOrNull() }
+            ?: beanName
+
+        /** Whether any handler of this bean handles [payloadType]. */
+        fun handles(payloadType: Class<*>): Boolean = handlerFor(payloadType) != null
 
         override fun toString(): String = bean.javaClass.simpleName
     }

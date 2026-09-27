@@ -129,6 +129,25 @@ class ThinEventStore internal constructor(
         return result
     }
 
+    /** Every payload type stored (one scan; an index on `payload_type` makes it an index-only scan). */
+    internal fun distinctPayloadTypes(): List<String> =
+        jdbc.queryForList("select distinct payload_type from $table", String::class.java)
+
+    /**
+     * One replay page: events of [payloadTypes] in `(aggregate_identifier, sequence_number)` order, after [after]
+     * (exclusive; `null` = from the start). Keyset pagination on the unique index: every page is a range scan.
+     * Per-aggregate order is guaranteed and the order is the same on every run.
+     */
+    internal fun readReplayPage(payloadTypes: Collection<String>, after: Pair<String, Long>?, limit: Int): List<DomainEventMessage<*>> {
+        if (payloadTypes.isEmpty()) return emptyList()
+        val types = payloadTypes.joinToString(", ") { "?" }
+        val keyset = if (after == null) "" else "and (aggregate_identifier > ? or (aggregate_identifier = ? and sequence_number > ?)) "
+        val sql = "select $columns from $table where payload_type in ($types) $keyset" +
+            "order by aggregate_identifier, sequence_number limit $limit"
+        val args: List<Any> = payloadTypes.toList() + (after?.let { listOf<Any>(it.first, it.first, it.second) } ?: emptyList())
+        return jdbc.query(sql, { rs, _ -> toMessage(rs) }, *args.toTypedArray())
+    }
+
     /** Latest readable snapshot of one aggregate. */
     internal fun readSnapshot(aggregateIdentifier: String): DomainEventMessage<*>? =
         readSnapshots(listOf(aggregateIdentifier))[aggregateIdentifier]

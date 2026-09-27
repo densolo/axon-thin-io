@@ -17,6 +17,7 @@ import org.springframework.beans.factory.ObjectProvider
 import org.springframework.beans.factory.annotation.Qualifier
 import org.springframework.boot.autoconfigure.AutoConfiguration
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.boot.context.properties.EnableConfigurationProperties
@@ -121,5 +122,26 @@ class ThinAxonAutoConfiguration {
         ThinTransactions(transactionManager.ifAvailable),
         eventStore.ifAvailable,
         properties.concurrencyRetries,
+    )
+}
+
+/** ProjectionMigrator — only with JPA (emptiness checks go through the EntityManagerFactory) and the event store. */
+@AutoConfiguration(after = [ThinAxonAutoConfiguration::class])
+@ConditionalOnClass(name = ["jakarta.persistence.EntityManagerFactory"])
+class ThinProjectionMigratorAutoConfiguration {
+
+    @Bean
+    @ConditionalOnBean(ThinEventStore::class, jakarta.persistence.EntityManagerFactory::class)
+    @ConditionalOnMissingBean
+    fun projectionMigrator(
+        registry: ThinHandlerRegistry,
+        eventGateway: ThinEventGateway,
+        eventStore: ThinEventStore,
+        entityManagerFactory: jakarta.persistence.EntityManagerFactory,
+        transactionManager: ObjectProvider<PlatformTransactionManager>,
+        properties: ThinAxonProperties,
+    ): ProjectionMigrator = ProjectionMigrator(
+        registry, eventGateway, eventStore, entityManagerFactory,
+        ThinTransactions(transactionManager.ifAvailable), properties.replayPageSize,
     )
 }

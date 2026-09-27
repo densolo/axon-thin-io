@@ -19,6 +19,9 @@ class ThinAxonProperties {
 
     val eventStore = EventStore()
 
+    /** ProjectionMigrator: events per page (one transaction per page). */
+    var replayPageSize: Int = 1000
+
     enum class EventHandlerErrorMode { LOG, PROPAGATE }
 
     /** Axon-compatible JDBC event store (same tables/columns as Axon's JpaEventStorageEngine). */

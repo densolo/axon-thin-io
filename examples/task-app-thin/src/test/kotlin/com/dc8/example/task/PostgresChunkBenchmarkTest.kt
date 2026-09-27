@@ -20,8 +20,8 @@ import kotlin.system.measureTimeMillis
  * Chunk timings and round trips on PostgreSQL (`mvn test -Ppostgres -Dtest=PostgresChunkBenchmarkTest`).
  * Prints a table; asserts only that event-store round trips per chunk do not grow with the chunk size.
  *
- * The example projections are deliberately naive (one `findById`/merge per event): their round trips show what
- * converting a projection to a batch handler (`findAllById` + batched writes) saves.
+ * `task_summary` is written by a naive per-event projection (one `findById`/merge per event); `task_title_index` by
+ * the batch projection [TaskTitleIndexProjection] (`findAllById` + JDBC-batched writes) — the difference is the point.
  */
 @EnabledIfSystemProperty(named = "thin.test.db", matches = "postgres")
 @SpringBootTest(properties = ["task.snapshot-threshold=100"])
@@ -35,13 +35,21 @@ class PostgresChunkBenchmarkTest {
         sql.contains("axon_domain_event_entry") || sql.contains("axon_snapshot_event_entry")
     }
 
-    private data class Row(val scenario: String, val chunks: Int, val commands: Int, val ms: Long, val eventStoreTrips: Int, val otherTrips: Int)
+    private val perEventProjection = { sql: String -> Regex("""\btask_summary\b""").containsMatchIn(sql) }
+    private val batchProjection = { sql: String -> sql.contains("task_title_index") }
+
+    private data class Row(
+        val scenario: String, val chunks: Int, val commands: Int, val ms: Long,
+        val eventStore: Int, val perEvent: Int, val batch: Int, val other: Int,
+    )
 
     private fun measure(scenario: String, chunks: List<List<Any>>): Row {
         recorder.clear()
         val ms = measureTimeMillis { chunks.forEach { bulk.sendAllAndWait(it) } }
         val es = recorder.count(eventStore)
-        return Row(scenario, chunks.size, chunks.sumOf { it.size }, ms, es, recorder.count { true } - es)
+        val perEvent = recorder.count(perEventProjection)
+        val batch = recorder.count(batchProjection)
+        return Row(scenario, chunks.size, chunks.sumOf { it.size }, ms, es, perEvent, batch, recorder.count { true } - es - perEvent - batch)
     }
 
     @Test
@@ -60,15 +68,18 @@ class PostgresChunkBenchmarkTest {
         )
 
         println()
-        println("| scenario | chunks | commands | ms | ms/command | event-store round trips | other round trips (projections) |")
-        println("|---|---:|---:|---:|---:|---:|---:|")
+        println("| scenario | chunks | commands | ms | ms/command | event store | task_summary (per-event) | task_title_index (batch) | other projections |")
+        println("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
         rows.forEach {
-            println("| ${it.scenario} | ${it.chunks} | ${it.commands} | ${it.ms} | ${"%.2f".format(it.ms.toDouble() / it.commands)} | ${it.eventStoreTrips} | ${it.otherTrips} |")
+            println(
+                "| ${it.scenario} | ${it.chunks} | ${it.commands} | ${it.ms} | ${"%.2f".format(it.ms.toDouble() / it.commands)} " +
+                    "| ${it.eventStore} | ${it.perEvent} | ${it.batch} | ${it.other} |",
+            )
         }
         println()
 
         // event store: ~4 round trips per chunk (snapshots, events, index, insert), whatever the chunk size
-        rows.forEach { assertThat(it.eventStoreTrips).describedAs(it.scenario).isLessThanOrEqualTo(it.chunks * 6) }
+        rows.forEach { assertThat(it.eventStore).describedAs(it.scenario).isLessThanOrEqualTo(it.chunks * 6) }
     }
 
     companion object {

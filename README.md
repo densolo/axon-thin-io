@@ -18,9 +18,9 @@ repositories.
 ## Modules
 
 ```
-axon-thin-api            BulkCommandGateway (no dependencies): the only API that is not an Axon type
-axon-thin                the thin runtime + Spring Boot auto-configuration (depends on axon-messaging for types only)
-axon-thin-v4-adapter     BulkCommandGateway on real Axon 4 (a TransactionTemplate around sendAndWait)
+axon-thin-api            the only non-Axon API, dependency-free: BulkCommandGateway + BulkOptions, ChunkContext, @ReplayInto
+axon-thin                the thin runtime + Spring Boot auto-configuration (uses Axon jars for their types only)
+axon-thin-v4-adapter     the same API on real Axon 4: sendAllAndWait (+ retry) and ChunkContext
 
 examples/task-model           Task aggregate (event-sourced, comments inside), an external command handler,
                               JPA read models + projections, query service (Axon types are `provided`)
@@ -180,6 +180,44 @@ skips it and replays the full stream. Axon 4.13 fails the command instead (`Inco
 `SerializationException`), because it deserializes the payload lazily, after its own fallback has already run.
 `ThinSnapshotFallbackTest` covers thin's behaviour.
 
+### Filling new projections: `ProjectionMigrator`
+
+Mark a projection with the JPA entities it writes, and call `migrate()` in the migration step that runs before the
+apps start:
+
+```kotlin
+@Component
+@ProcessingGroup("task-summary")
+@ReplayInto(TaskSummary::class)                 // entity classes; the table name comes from @Table
+class TaskSummaryProjection(...) { ... }
+
+@Component
+class Migrator(private val projections: ProjectionMigrator) : ApplicationRunner {
+    override fun run(args: ApplicationArguments) { projections.migrate() }   // returns one result per projection
+}
+```
+
+For each `@ReplayInto` projection, `migrate()` does this:
+
+| State | Result |
+|---|---|
+| any of its entities has rows | `NOT_EMPTY`: left alone; it is live |
+| some entities empty, others not | `PARTIALLY_EMPTY`: left alone, with a warning |
+| all empty, but no stored event it handles | `NO_EVENTS`: nothing to do |
+| all empty and relevant events exist | `REPLAYED` |
+
+- **Emptiness:** one JPQL query per entity (milliseconds).
+- **Relevant event types:** found with one `select distinct payload_type` (an index on `payload_type` makes it
+  instant), and matched against the projection's handlers, including supertype handlers. Types this code can't load,
+  for example ones from another branch, are skipped.
+- **One pass for all:** every projection to replay is filled in a single pass. The pass goes in
+  `(aggregate_identifier, sequence_number)` order (per-aggregate order guaranteed, the same order on every run), in
+  pages of `axon.thin.replay-page-size` events (default 1000), one transaction per page. Pages are delivered like live
+  chunks: batch handlers get each page as one list.
+- **Handler failures** fail the migration. Events published by handlers during a replay are dropped.
+- **Resetting is up to you.** To rebuild a projection, empty or rename its table (for example a Liquibase change that
+  switches to `task_summary_v3`); the next `migrate()` fills it. Beans without `@ReplayInto` are never replayed.
+
 ### Processing groups
 
 Thin accepts `@ProcessingGroup` and ignores it: every event handler bean receives every event, as one subscribing
@@ -192,24 +230,146 @@ The transaction gives atomicity. Thin still keeps a small internal scope per com
 `UnitOfWork` API. It provides:
 1. **Deferred events.** Events are stored and dispatched after the handler returns, which is Axon's order.
 2. **An aggregate identity map.** An aggregate is loaded once and shared by nested commands, so sequence numbers
-   stay consistent. Inside `sendAllAndWait` the map spans the whole batch.
+   stay consistent. It spans the whole chunk, so each aggregate is loaded once per `sendAllAndWait`.
 3. **The thread-bound `AggregateLifecycle` scope** that `apply()` needs.
 4. **Correlation metadata.**
 5. **Discarding events of a failed nested command.**
 
-### Not supported (yet)
+## Assumptions
 
+Thin is built for one deployment shape. These are the things it relies on; breaking one of them is where surprises
+come from.
+
+**Architecture**
+- **Everything is synchronous and local.** Commands are handled on the caller's thread, and projections run in
+  the command's transaction (subscribing). There is no command routing and no distributed command bus.
+- **Processes share only the database.** The backend and the jobs communicate through the event store and the read
+  models, nothing else.
+- **No tracking processors.** Nothing reads the event store by `global_index` position, and `token_entry` is not
+  used. A stale row left there by an old Axon processor is harmless.
+- **Queries go directly to repositories or services.** There is no `QueryGateway`.
+- **Projections are independent across aggregates.** A projection only needs per-aggregate event order (replays
+  rely on this).
+
+**Data and schema**
+- **Unique index on `(aggregate_identifier, sequence_number)`.** It is the only concurrency guard. An orm.xml
+  `<table>` override drops Axon's own `@Table` index, so check that your database still has it.
+- **`bytea` payload columns on PostgreSQL** (not `oid`).
+- **The `global_index` sequence's `INCREMENT BY` equals `allocation-size`** (50 by default, as Hibernate creates
+  it).
+- **One serializer configuration in every process:** the same Jackson `ObjectMapper` setup and the same Axon
+  serializer settings.
+- **Aggregates are Jackson-serializable**, because snapshots serialize the aggregate itself.
+
+**Evolution and deployment**
+- **Event classes evolve additively:** new fields are optional or have defaults, and deserialization tolerates
+  unknown fields. There are no upcasters.
+- **Readers deploy before writers.** Backend and jobs deploy the same domain module version (events, aggregates,
+  projections, serializer config).
+- **An aggregate ignores event types it can't load.** That's the same as Axon, but it means aggregate state can
+  be silently wrong after an out-of-order deploy.
+- **New aggregates get random ids.** Duplicate creates are not expected; if one happens, it fails with
+  `AggregateStreamCreationException`.
+- **Resetting projections is manual** (Liquibase), and `ProjectionMigrator.migrate()` runs before the apps start.
+  Different branches never run against the same database at the same time.
+
+## Running several processes (backend + jobs)
+
+Both processes run thin against one database. There is **no locking**: concurrency is optimistic, and the database
+is the arbiter.
+
+| Concern | What happens | What to do |
+|---|---|---|
+| Two writers change the same aggregate | The second append violates the unique index → `ConcurrencyException`; its whole chunk rolls back (events and projections) | `BulkOptions(concurrencyRetries = n)` or `axon.thin.concurrency-retries` re-runs the chunk with a fresh load, so the delta lands on the latest state. Retries use exponential backoff with jitter (5 ms … 1 s). |
+| Same field changed by two users or processes | Last writer wins; both changes are in the event store | Accepted by design; the history shows who changed what |
+| Large job chunk vs frequent UI edits on the same aggregates | Optimistic chunks can **starve**: every retry loses to another writer | Keep job chunks small (100–500) when they overlap with interactive work. The concurrency test shows a 50-aggregate chunk under users with no think time losing 20 retries in a row. |
+| Validation across aggregates (done in code) | Each process only sees the other's *committed* data, so two processes can both pass the same rule | Put a database constraint behind rules that must hold |
+| Read-model rows shared by several aggregates (totals, counters) | Updates from two transactions can overwrite each other | `@Version` on the entity, or atomic `update … set x = x + 1` |
+| Per-aggregate read-model rows | Safe: they're written in the writer's transaction, in sequence order | — |
+| Event-handler side effects (email, messages) | They run inside the transaction; after a rollback they have still happened, and after a retry they happen twice | Outbox table, or send after commit |
+| `global_index` order | Each process draws its own blocks of 50, so the index is **not** in commit order (≈5 % inversions measured) | Irrelevant without tracking readers; replays use per-aggregate order |
+| Snapshots from both processes | Duplicates are ignored, older snapshots replaced | — |
+
+`PostgresConcurrencyTest` covers this. Two application contexts (a "backend" with two users, and "jobs" with chunks of
+50) write concurrently to the same 50 aggregates. That produces 1,250 events, with 48 retries logged in one run.
+Afterwards every stream has contiguous sequence numbers, every read model equals the aggregate's last event, and no
+event is lost or duplicated.
+
+## Benchmark
+
+`mvn test -Ppostgres -pl examples/task-app-thin -Dtest=PostgresChunkBenchmarkTest`
+
+Setup:
+- MacBook Air M1 (16 GB), Docker Desktop, `postgres:17-alpine` started with `fsync=off`.
+- Hibernate batch size 100, `reWriteBatchedInserts=true`.
+- Four projections: per-event `task_summary`, `task_comment` and `task_activity`, plus the batch `task_title_index`.
+
+**Read the round-trip counts, not the milliseconds.** Absolute times are optimistic: local Docker, no disk sync, no
+network latency. On a real network every round trip adds latency, which makes the round-trip column matter more.
+
+| scenario | chunks | commands | ms | ms/command | event store | `task_summary` (per-event) | `task_title_index` (batch) | other projections |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| create 100, one chunk | 1 | 100 | 41 | 0.41 | 2 | 101 | 2 | 3 |
+| create 1k, one chunk | 1 | 1,000 | 341 | 0.34 | 2 | 1,010 | 11 | 30 |
+| rename 100, one chunk | 1 | 100 | 60 | 0.60 | 4 | 101 | 2 | 3 |
+| rename 1k, one chunk | 1 | 1,000 | 329 | 0.33 | 4 | 1,010 | 11 | 30 |
+| create 10k, chunks of 500 | 20 | 10,000 | 2,330 | 0.23 | 40 | 10,100 | 120 | 300 |
+
+What it shows:
+- **The event store costs a constant number of round trips per chunk:** 2 for creates (index + insert), 4 for
+  updates (+ snapshots + events), whatever the chunk size.
+- **A per-event projection costs about one round trip per command.** One `findById` or merge per event dominates
+  everything else.
+- **A batch projection costs 1 read plus one write per 100 rows:** 11 instead of 1,010 for 1k commands.
+  `TaskTitleIndexProjection` (test sources) is the pattern: `findAllById` per chunk, `Persistable.isNew` so new rows
+  are INSERTed without a SELECT first, JDBC-batched writes, and one `delete … where id in (…)`. `ThinBatchProjectionTest`
+  asserts exactly 1 + 10 round trips. Converting hot projections is the main performance lever.
+
+## Limitations
+
+**Not supported (yet)**
 - **Aggregates:** `@AggregateMember` entities, `AggregateLifecycle.createNew`, `@TargetAggregateVersion`, and
   state-stored (JPA) aggregates.
 - **Snapshots:** `@Aggregate(snapshotFilter)` is ignored.
-- **Upcasters.**
-- **Other Axon features:** sagas, deadlines, queries, handler interceptors, `UnitOfWork` parameters, custom
-  correlation providers, and tracking processors.
-- **PostgreSQL `oid` payload columns.** Hibernate's default for Axon's `@Lob byte[]` is `oid`; thin reads and
-  writes `bytea` (the usual orm.xml override).
+- **Upcasters** (events must evolve additively).
+- **Other Axon features:** sagas, deadlines, queries (`QueryGateway`, `@QueryHandler`), handler interceptors,
+  `UnitOfWork` parameters, custom correlation providers, and tracking processors.
+- **PostgreSQL `oid` payload columns:** thin reads and writes `bytea`.
+- **Async snapshot executor:** snapshots are built synchronously after commit.
 
-Run the scanner on the real project to decide which of these are needed. It also lists your `axon-orm.xml`
-overrides.
+**Deliberate differences from Axon 4**
+- **Chunk visibility:** projections see a chunk's events only after its last command. Validation uses `ChunkContext`
+  for what the chunk did so far.
+- **Dispatch order:** each handler bean receives a whole chunk before the next bean does (Axon dispatches event by
+  event across beans).
+- **Batch `@EventHandler(List<…>)` handlers** exist only in thin.
+- **Unreadable snapshots** are skipped (full replay) instead of failing the command.
+- **Duplicate command handlers** fail at startup instead of being logged.
+- **`@ProcessingGroup` is ignored**, and there are no tracking tokens.
+- **Replay order** is per aggregate, not `global_index`.
+
+**Operational notes**
+- **No locking:** heavy overlap between jobs and users on the same aggregates means more retries (see above).
+- **`ChunkContext.aggregate()` is read-only.** Change aggregates through commands only.
+- **Replays read all history**, so every old event version must still deserialize.
+
+## Migrating a project from Axon 4
+
+1. **Run the scanner** (`scripts/axon-usage-scan`) and check its MISSING and PARTIAL rows against the limitations
+   above.
+2. **Database:** check that `bytea` payload columns and the unique index on `(aggregate_identifier, sequence_number)`
+   exist. Set `axon.thin.event-store.table-prefix` (or the table names) to match your `axon-orm.xml`.
+3. **Serializer:** keep `axon.serializer.*=jackson` semantics; thin builds the same `JacksonSerializer` from your
+   `ObjectMapper`.
+4. **Snapshots:** keep your `SnapshotTriggerDefinition` beans; thin supplies the `Snapshotter`.
+5. **Swap engines in both processes together:** replace the Axon starter with `axon-thin`. Backend and jobs switch in
+   the same release.
+6. **Use the new API where it pays off:**
+   - `sendAllAndWait` for bulk work, with `concurrencyRetries` for jobs;
+   - `ChunkContext` in validation;
+   - batch handlers for hot projections;
+   - `@ReplayInto` plus `migrate()` for projections you want to be able to rebuild.
+7. **Before switching:** run your suite against thin on PostgreSQL (`-Ppostgres`), not just H2.
 
 ## Build & test
 
@@ -233,16 +393,5 @@ mvn test -Ppostgres -pl examples/task-app-thin -Dtest=PostgresChunkBenchmarkTest
 - **Axon 4 on PostgreSQL** needs `bytea` payload columns (Hibernate's default for `@Lob byte[]` is `oid`). The tests use
   `ByteaEnforcedPostgresSQLDialect`, as recommended in Axon's reference guide. Your production mapping must also
   produce `bytea`.
-
-**Lessons from the PostgreSQL runs**
-- **Event-store round trips per chunk are constant:** 2 for creates, 4 for updates (snapshots, events, index,
-  insert), whatever the chunk size.
-- **Naive projections dominate.** With one `findById`/merge per event, projections cost about one round trip per
-  command, which is 1,040 of 1,044 round trips for 1k commands. Converting a hot projection to a batch handler
-  (`findAllById` + batched writes, `Persistable.isNew` for assigned ids) is the next lever.
-- **Large optimistic chunks can starve under sustained contention on their aggregates.** Retries use exponential
-  backoff with jitter. If jobs keep losing races to users, use smaller chunks.
-- **Pooled `global_index` blocks from two processes are not in commit order** (about 5% inversions in the concurrency
-  test). This only matters if something reads the store by `global_index`.
 
 JDK 21+ (bytecode target 21), Kotlin 2.4, Spring Boot 3.5, H2 and PostgreSQL 17.
