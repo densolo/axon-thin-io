@@ -1,6 +1,7 @@
 package com.dc8.axonthin
 
 import com.dc8.axonthin.aggregate.ThinSnapshotter
+import com.dc8.axonthin.api.ChunkContext
 import com.dc8.axonthin.eventstore.GlobalIndexAllocator
 import com.dc8.axonthin.eventstore.PooledSequenceAllocator
 import com.dc8.axonthin.eventstore.ThinEventStore
@@ -38,6 +39,10 @@ class ThinAxonAutoConfiguration {
 
     @Bean
     fun thinHandlerRegistry(): ThinHandlerRegistry = ThinHandlerRegistry()
+
+    @Bean
+    @ConditionalOnMissingBean(ChunkContext::class)
+    fun thinChunkContext(): ChunkContext = ThinChunkContext()
 
     /**
      * Same serializer Axon's Spring Boot autoconfig builds for `axon.serializer.events=jackson`:

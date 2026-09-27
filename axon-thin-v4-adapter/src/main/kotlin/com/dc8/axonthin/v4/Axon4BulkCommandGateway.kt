@@ -3,6 +3,7 @@ package com.dc8.axonthin.v4
 import com.dc8.axonthin.api.BulkCommandGateway
 import com.dc8.axonthin.api.BulkOptions
 import org.axonframework.commandhandling.gateway.CommandGateway
+import org.axonframework.messaging.Message
 import org.axonframework.modelling.command.ConcurrencyException
 import org.springframework.transaction.PlatformTransactionManager
 import org.springframework.transaction.support.TransactionSynchronizationManager
@@ -27,11 +28,25 @@ class Axon4BulkCommandGateway(
         var attempt = 0
         while (true) {
             try {
-                return transaction.execute { commands.map { commandGateway.sendAndWait<Any?>(it) } }!!
+                return transaction.execute { runChunk(commands) }!!
             } catch (e: ConcurrencyException) {
                 if (!ownsTransaction || attempt >= options.concurrencyRetries) throw e
                 attempt++
             }
+        }
+    }
+
+    private fun runChunk(commands: List<Any>): List<Any?> {
+        val chunk = Axon4ChunkContext.Chunk(commands.map { (it as? Message<*>)?.payload ?: it })
+        val previous = Axon4ChunkContext.chunk.get()
+        Axon4ChunkContext.chunk.set(chunk)
+        try {
+            return commands.mapIndexed { index, command ->
+                chunk.index = index
+                commandGateway.sendAndWait<Any?>(command)
+            }
+        } finally {
+            if (previous == null) Axon4ChunkContext.chunk.remove() else Axon4ChunkContext.chunk.set(previous)
         }
     }
 }

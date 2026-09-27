@@ -91,6 +91,26 @@ What that means for your code:
   the chunk with freshly loaded aggregates, so your deltas land on the latest state. There is no retry inside a
   caller's transaction, and no retry on `AggregateStreamCreationException`.
 
+**Validating within a chunk: `ChunkContext`** (in `axon-thin-api`; inject it, or declare it as a handler parameter):
+
+```kotlin
+@CommandHandler
+fun handle(command: ReserveTitleCommand, chunk: ChunkContext) {
+    val taken = summaries.existsByTitle(command.title) ||                       // committed + earlier chunks
+        chunk.pendingEvents<TaskCreatedEvent>().any { it.title == command.title } // this chunk so far
+    if (taken) throw TitleTakenException(command.title)
+}
+```
+
+| `ChunkContext` | axon-thin | Axon 4 (v4 adapter) |
+|---|---|---|
+| `pendingEvents()` | events applied or published in this chunk, not yet seen by projections, in order | always empty (projections are updated per command) |
+| `commands()` / `currentCommandIndex()` | the chunk's top-level commands and the position of the current one | same |
+| `aggregate<T>(id)` | the chunk's in-memory aggregate root (never queries); read-only | `null` |
+
+The same validation code is therefore correct on both engines. The contract suite checks this
+(`validation sees changes made earlier in the same chunk`).
+
 On Axon 4 (the v4 adapter), a chunk runs command by command. Storage and single-command behaviour stay covered by the
 shared contract suite; chunk semantics are thin-only.
 

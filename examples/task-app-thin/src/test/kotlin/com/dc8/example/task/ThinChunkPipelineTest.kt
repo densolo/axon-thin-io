@@ -2,12 +2,15 @@ package com.dc8.example.task
 
 import com.dc8.axonthin.api.BulkCommandGateway
 import com.dc8.axonthin.api.BulkOptions
+import com.dc8.axonthin.api.ChunkContext
+import com.dc8.axonthin.api.aggregate
 import com.dc8.example.task.api.CreateTaskCommand
 import com.dc8.example.task.api.RenameTaskCommand
 import com.dc8.example.task.api.TaskCreatedEvent
 import com.dc8.example.task.api.TaskEvent
 import com.dc8.example.task.api.TaskRenamedEvent
 import com.dc8.example.task.contract.StoredEvents
+import com.dc8.example.task.domain.Task
 import com.dc8.example.task.query.TaskQueryService
 import net.ttddyy.dsproxy.ExecutionInfo
 import net.ttddyy.dsproxy.QueryInfo
@@ -71,6 +74,8 @@ class ThinChunkPipelineTest {
         batchProjection.calls.clear()
         interference.reset()
         visibility.seen.clear()
+        visibility.pending.clear()
+        visibility.aggregate = null
     }
 
     private fun id() = UUID.randomUUID().toString()
@@ -144,7 +149,9 @@ class ThinChunkPipelineTest {
 
         bulk.sendAllAndWait(listOf(CreateTaskCommand(taskId, "new"), ProbeVisibilityCommand(taskId)))
 
-        assertThat(visibility.seen).containsExactly(false) // inside the chunk: summary not written yet
+        assertThat(visibility.seen).containsExactly(false) // inside the chunk: summary not written yet …
+        assertThat(visibility.pending).singleElement().isInstanceOf(TaskCreatedEvent::class.java) // … but pending
+        assertThat(visibility.aggregate).isNotNull          // and the in-memory aggregate is available
         assertThat(queries.summary(taskId)).isNotNull     // after the chunk
     }
 
@@ -209,13 +216,17 @@ class ThinChunkPipelineTest {
         }
     }
 
-    /** Checks, from inside a chunk, whether the summary of a task created earlier in the chunk is visible. */
-    class VisibilityProbe(private val queries: TaskQueryService) {
+    /** Checks, from inside a chunk, what a task created earlier in the chunk looks like to validation code. */
+    class VisibilityProbe(private val queries: TaskQueryService, private val chunk: ChunkContext) {
         val seen = CopyOnWriteArrayList<Boolean>()
+        val pending = CopyOnWriteArrayList<Any>()
+        var aggregate: Task? = null
 
         @CommandHandler
         fun handle(command: ProbeVisibilityCommand) {
             seen += queries.summary(command.taskId) != null
+            pending.addAll(chunk.pendingEvents())
+            aggregate = chunk.aggregate<Task>(command.taskId)
         }
     }
 
@@ -288,7 +299,7 @@ class ThinChunkPipelineTest {
     class Config {
         @Bean fun sqlRecorder() = SqlRecorder()
         @Bean fun batchRecordingProjection() = BatchRecordingProjection()
-        @Bean fun visibilityProbe(queries: TaskQueryService) = VisibilityProbe(queries)
+        @Bean fun visibilityProbe(queries: TaskQueryService, chunk: ChunkContext) = VisibilityProbe(queries, chunk)
 
         @Bean
         fun interference(

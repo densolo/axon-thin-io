@@ -1,6 +1,7 @@
 package com.dc8.axonthin.v4
 
 import com.dc8.axonthin.api.BulkCommandGateway
+import com.dc8.axonthin.api.ChunkContext
 import org.axonframework.commandhandling.gateway.CommandGateway
 import org.springframework.boot.autoconfigure.AutoConfiguration
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean
@@ -16,6 +17,10 @@ import org.springframework.transaction.PlatformTransactionManager
     ],
 )
 class Axon4BulkAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean(ChunkContext::class)
+    fun axon4ChunkContext(): ChunkContext = Axon4ChunkContext()
 
     @Bean
     @ConditionalOnMissingBean(BulkCommandGateway::class)

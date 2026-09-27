@@ -113,7 +113,12 @@ class ThinCommandGateway internal constructor(
 
     private fun runChunk(commands: List<CommandMessage<*>>, uow: ThinUnitOfWork): List<Any?> {
         preload(commands, uow)
-        val results = commands.map { handle(it, uow) }
+        uow.chunkCommands = commands
+        val results = commands.mapIndexed { index, command ->
+            uow.currentCommandIndex = index
+            handle(command, uow)
+        }
+        uow.currentCommandIndex = -1
         eventGateway.flush(uow)
         return results
     }

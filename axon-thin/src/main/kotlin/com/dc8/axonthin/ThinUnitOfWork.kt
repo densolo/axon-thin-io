@@ -27,6 +27,13 @@ internal class ThinUnitOfWork private constructor() {
     private val pendingEvents = ArrayDeque<EventMessage<*>>()
     private val messages = ArrayDeque<Message<*>>()
 
+    /** Top-level commands of the chunk and the one being handled (for ChunkContext). */
+    var chunkCommands: List<Message<*>> = emptyList()
+    var currentCommandIndex: Int = -1
+
+    /** Events queued and not yet handed to event handlers. */
+    val pendingEventsSnapshot: List<EventMessage<*>> get() = pendingEvents.toList()
+
     /** The message currently being handled; source of correlation data for anything it publishes. */
     val currentMessage: Message<*>? get() = messages.lastOrNull()
 

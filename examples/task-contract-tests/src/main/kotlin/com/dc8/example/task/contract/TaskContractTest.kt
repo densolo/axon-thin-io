@@ -63,6 +63,7 @@ abstract class TaskContractTest {
     @Autowired lateinit var comments: CommentViewRepository
     @Autowired lateinit var activities: TaskActivityRepository
     @Autowired lateinit var jdbc: JdbcTemplate
+    @Autowired lateinit var chunkPositions: ChunkPositionRecorder
 
     protected open val eventTable = "axon_domain_event_entry"
     protected val stored by lazy { StoredEvents(jdbc, eventTable) }
@@ -321,6 +322,40 @@ abstract class TaskContractTest {
         stored.deleteEventsUpTo(taskId, stored.snapshots(taskId).single().sequenceNumber)
         commandGateway.sendAndWait<Any>(RenameTaskCommand(taskId, "b12"))
         assertThat(queries.summary(taskId)!!.title).isEqualTo("b12")
+    }
+
+    // ---- chunk context (validation during bulk) --------------------------------------------------------------------
+
+    @Test
+    fun `validation sees changes made earlier in the same chunk`() {
+        val title = "unique-${id()}"
+
+        assertThatThrownBy {
+            bulk.sendAllAndWait(listOf(CreateTaskCommand(id(), title), ReserveTitleCommand(title)))
+        }.isInstanceOf(TitleTakenException::class.java)
+        assertThat(stored.count()).isZero()
+    }
+
+    @Test
+    fun `validation sees committed state and lets unrelated titles pass`() {
+        val title = "unique-${id()}"
+        createTask(title)
+
+        assertThatThrownBy { bulk.sendAllAndWait(listOf(ReserveTitleCommand(title))) }
+            .isInstanceOf(TitleTakenException::class.java)
+        bulk.sendAllAndWait(listOf(ReserveTitleCommand("free-${id()}"), CreateTaskCommand(id(), "other-${id()}")))
+    }
+
+    @Test
+    fun `chunk context reports the chunk's commands and the current position`() {
+        chunkPositions.seen.clear()
+
+        bulk.sendAllAndWait(
+            listOf(CreateTaskCommand(id(), "x"), RecordChunkPositionCommand("bulk"), CreateTaskCommand(id(), "y")),
+        )
+        commandGateway.sendAndWait<Any>(RecordChunkPositionCommand("single"))
+
+        assertThat(chunkPositions.seen).containsExactly(Triple("bulk", 1, 3), Triple("single", 0, 1))
     }
 
     // ---- storage format (what the other engine / other services will read) -----------------------------------------
