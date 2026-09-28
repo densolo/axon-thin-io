@@ -1,6 +1,7 @@
 package app.dc8.example.task.contract
 
 import app.dc8.axonthin.api.BulkCommandGateway
+import app.dc8.example.task.TaskBulkRenameService
 import app.dc8.example.task.TaskService
 import app.dc8.example.task.api.AddCommentCommand
 import app.dc8.example.task.api.AssignTaskCommand
@@ -29,7 +30,9 @@ import org.axonframework.commandhandling.CommandResultMessage
 import org.axonframework.commandhandling.GenericCommandMessage
 import org.axonframework.commandhandling.NoHandlerForCommandException
 import org.axonframework.commandhandling.gateway.CommandGateway
+import org.axonframework.eventhandling.GenericDomainEventMessage
 import org.axonframework.eventhandling.gateway.EventGateway
+import org.axonframework.eventsourcing.eventstore.EventStore
 import org.axonframework.eventsourcing.AggregateDeletedException
 import org.axonframework.messaging.MetaData
 import org.axonframework.modelling.command.AggregateNotFoundException
@@ -66,6 +69,8 @@ abstract class TaskContractTest {
     @Autowired lateinit var activities: TaskActivityRepository
     @Autowired lateinit var jdbc: JdbcTemplate
     @Autowired lateinit var chunkPositions: ChunkPositionRecorder
+    @Autowired lateinit var eventStore: EventStore
+    @Autowired lateinit var bulkRename: TaskBulkRenameService
 
     protected open val eventTable = "axon_domain_event_entry"
     protected val stored by lazy { StoredEvents(jdbc, eventTable) }
@@ -360,6 +365,64 @@ abstract class TaskContractTest {
         assertThat(chunkPositions.seen).containsExactly(Triple("bulk", 1, 3), Triple("single", 0, 1))
     }
 
+    // ---- direct EventStore use (pre-thin patterns that must keep working) ---------------------------------------------
+
+    @Test
+    fun `bulk pattern - flagged single events plus a bulk event published to the EventStore`() {
+        val ids = List(3) { createTask("before $it") }
+
+        bulkRename.renameAll(ids.associateWith { "bulk $it" })
+        commandGateway.sendAndWait<Any>(RenameTaskCommand(ids[0], "single after bulk"))
+
+        assertThat(ids.map { queries.summary(it)!!.title })
+            .containsExactly("single after bulk", "bulk ${ids[1]}", "bulk ${ids[2]}")
+        ids.forEach { id ->
+            assertThat(stored.forAggregate(id)[1].payload).containsEntry("title", "bulk $id").containsEntry("bulk", true)
+        }
+        val envelope = stored.all().single { it.type == TaskBulkRenameService.BULK_TYPE }
+        assertThat(envelope.aggregateIdentifier).startsWith("${TaskBulkRenameService.BULK_TYPE}-")
+        assertThat(envelope.sequenceNumber).isZero()
+        @Suppress("UNCHECKED_CAST")
+        assertThat((envelope.payload["renames"] as List<Map<String, Any>>).map { it["taskId"] }).containsExactlyElementsOf(ids)
+    }
+
+    @Test
+    fun `an aggregate created by publishing its first event directly can be used by commands`() {
+        val taskId = id()
+
+        bulkRename.createDirectly(taskId, "direct")
+        commandGateway.sendAndWait<Any>(RenameTaskCommand(taskId, "renamed by command"))
+
+        assertThat(queries.summary(taskId)!!.title).isEqualTo("renamed by command")
+        assertThat(stored.forAggregate(taskId).map { it.sequenceNumber to it.type }).containsExactly(0L to "Task", 1L to "Task")
+    }
+
+    @Test
+    fun `EventStore readEvents returns the stream, with the latest snapshot first`() {
+        val taskId = createTask("r0")
+        (1..2).forEach { commandGateway.sendAndWait<Any>(RenameTaskCommand(taskId, "r$it")) }
+
+        assertThat(eventStore.readEvents(taskId).asStream().map { it.sequenceNumber to it.payloadType.simpleName }.toList())
+            .containsExactly(0L to "TaskCreatedEvent", 1L to "TaskRenamedEvent", 2L to "TaskRenamedEvent")
+
+        (3..5).forEach { commandGateway.sendAndWait<Any>(RenameTaskCommand(taskId, "r$it")) } // snapshot at seq 4
+        val withSnapshot = eventStore.readEvents(taskId).asStream().toList()
+        assertThat(withSnapshot.map { it.sequenceNumber }).containsExactly(4L, 5L)
+        assertThat(withSnapshot.first().payloadType.simpleName).isEqualTo("Task") // the snapshot: the aggregate itself
+        assertThat(eventStore.readEvents(taskId, 3).asStream().map { it.sequenceNumber }.toList()).containsExactly(3L, 4L, 5L)
+        assertThat(eventStore.lastSequenceNumberFor(taskId)).contains(5L)
+    }
+
+    @Test
+    fun `publishing an event with a sequence number that is taken fails`() {
+        val taskId = createTask("taken")
+
+        assertThatThrownBy {
+            eventStore.publish(GenericDomainEventMessage("Task", taskId, 0, TaskRenamedEvent(taskId, "dup")))
+        }.isInstanceOf(AggregateStreamCreationException::class.java)
+        assertThat(stored.forAggregate(taskId)).hasSize(1)
+    }
+
     // ---- storage format (what the other engine / other services will read) -----------------------------------------
 
     @Test
@@ -395,6 +458,19 @@ abstract class TaskContractTest {
         assertThat(assigned.payload).isEqualTo(mapOf("taskId" to taskId, "assignee" to "zoe"))
         assertThat(queries.activity(taskId).map { it.eventId to it.sequenceNumber })
             .containsExactly(created.eventIdentifier to 0L, assigned.eventIdentifier to 1L)
+    }
+
+    @Test
+    fun `events are written with the application's serializer bean`() {
+        val taskId = createTask()
+
+        commandGateway.sendAndWait<Any>(ChangeTaskStatusCommand(taskId, TaskStatus.IN_PROGRESS))
+        commandGateway.sendAndWait<Any>(ChangeTaskStatusCommand(taskId, TaskStatus.DONE)) // reload: reads it back
+
+        // ApplicationSerializerFixture writes TaskStatus in lowercase: the stored JSON proves which serializer was used
+        assertThat(stored.forAggregate(taskId).drop(1).map { it.payload["from"] to it.payload["to"] })
+            .containsExactly("todo" to "in_progress", "in_progress" to "done")
+        assertThat(queries.summary(taskId)!!.status).isEqualTo(TaskStatus.DONE)
     }
 
     @Test

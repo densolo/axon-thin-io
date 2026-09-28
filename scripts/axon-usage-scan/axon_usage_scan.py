@@ -110,7 +110,7 @@ CATALOG: dict[str, tuple[str, str, str]] = {
     "AggregateIdentifier": ("aggregates", S, ""),
     "AggregateVersion": ("aggregates", P, "not written for event-sourced aggregates (same as Axon)"),
     "EntityId": ("aggregates", M, "aggregate members"),
-    "AggregateLifecycle": ("aggregates", P, "apply/andThenApply/isLive/getVersion/markDeleted; createNew() missing"),
+    "AggregateLifecycle": ("aggregates", P, "status derived from calls: see METHOD_SUPPORT (createNew unsupported)"),
     "EventSourcingHandler": ("aggregates", S, ""),
     "CreationPolicy": ("aggregates", S, "ALWAYS, CREATE_IF_MISSING, NEVER"),
     "AggregateCreationPolicy": ("aggregates", S, ""),
@@ -164,6 +164,12 @@ CATALOG: dict[str, tuple[str, str, str]] = {
     "HandlerEnhancerDefinition": ("extension", M, ""),
     "ParameterResolverFactory": ("extension", M, "custom parameter resolvers"),
     "Registration": ("commands", S, "interceptor registration handle"),
+}
+
+# Types where thin supports only some methods: the status is derived from the calls actually found
+# (type -> supported methods, unsupported methods). A type used without any unsupported call is SUPPORTED.
+METHOD_SUPPORT: dict[str, tuple[set[str], set[str]]] = {
+    "AggregateLifecycle": ({"apply", "markDeleted", "isLive", "getVersion"}, {"createNew"}),
 }
 
 # Annotations whose methods we treat as handlers (signature details are captured).
@@ -229,7 +235,8 @@ def snippet_at(lines: list[str], line: int) -> str:
     return lines[line - 1].strip()[:160] if 0 < line <= len(lines) else ""
 
 
-IMPORT_RE = re.compile(r"^\s*import\s+(static\s+)?(org\.axonframework\.[\w.]+(?:\.\*)?)(?:\s+as\s+(\w+))?\s*;?",
+# identifiers joined by single dots (a greedy [\w.]+ would swallow the "." of a wildcard import and crash the scan)
+IMPORT_RE = re.compile(r"^\s*import\s+(static\s+)?(org\.axonframework(?:\.\w+)+(?:\.\*)?)(?:\s+as\s+(\w+))?\s*;?",
                        re.M)
 INLINE_FQN_RE = re.compile(r"\borg\.axonframework\.(?:[a-z]\w*\.)+([A-Z]\w*)")
 ANNOTATION_RE = re.compile(r"@([A-Z]\w*)")
@@ -499,6 +506,12 @@ def scan_source(path: Path, rel: str, module: str, rep: Report) -> None:
                 rep.member_calls[f"{cname}.{m.group(1)}"].append(occ(m.start()))
         for m in re.finditer(rf"(?<![\w.]){re.escape(local)}\s*\.\s*(\w+)\s*[(<]", body[body_start:]):
             rep.member_calls[f"{cname}.{m.group(1)}"].append(occ(body_start + m.start()))
+    for pkg in wildcard_pkgs:
+        owner = pkg.rsplit(".", 1)[-1]
+        if owner in METHOD_SUPPORT:  # member wildcard import: bare calls belong to that type
+            supported, unsupported = METHOD_SUPPORT[owner]
+            for method in supported | unsupported:
+                function_imports.setdefault(method, f"{owner}.{method}")
     for local, qualified in function_imports.items():
         for m in re.finditer(rf"(?<![\w.]){re.escape(local)}\s*[(<]", body[body_start:]):
             rep.member_calls[qualified].append(occ(body_start + m.start()))
@@ -708,6 +721,21 @@ def _param_supported(label: str) -> bool:
     return True  # Message types, MetaData or Spring beans
 
 
+def feature_status(rep: Report, name: str) -> tuple[str, str, str]:
+    """(area, status, note) for a catalog type; method-level types are judged by the calls actually found."""
+    area, status, note = CATALOG[name]
+    if name not in METHOD_SUPPORT:
+        return area, status, note
+    supported, unsupported = METHOD_SUPPORT[name]
+    used = {call.split(".", 1)[1] for call in rep.member_calls if call.startswith(name + ".")}
+    blocked = sorted(used & unsupported)
+    if blocked:
+        where = ", ".join(f"`{o.file}:{o.line}`" for m in blocked for o in rep.member_calls[f"{name}.{m}"][:3])
+        return area, P, f"uses unsupported {', '.join(m + '()' for m in blocked)} at {where}"
+    listed = ", ".join(sorted(used)) or "no calls found"
+    return area, S, f"uses {listed} (supported: {', '.join(sorted(supported))})"
+
+
 def to_json(rep: Report, examples: int) -> dict:
     def occs(v: list[Occurrence]) -> dict:
         return {"count": len(v), "examples": [o.__dict__ for o in v[:examples]]}
@@ -720,7 +748,7 @@ def to_json(rep: Report, examples: int) -> dict:
         "dependencies": {k: sorted(v) for k, v in sorted(rep.dependencies.items())},
         "features": {
             name: {
-                "area": CATALOG[name][0], "thin": CATALOG[name][1], "note": CATALOG[name][2],
+                **dict(zip(("area", "thin", "note"), feature_status(rep, name))),
                 "annotation_targets": dict(rep.annotations.get(name, {})),
                 "modules": dict(Counter(o.module for o in v)),
                 **occs(v),
@@ -756,7 +784,7 @@ def to_markdown(rep: Report, examples: int) -> str:
     rows = []
     for name, v in rep.names.items():
         if name in CATALOG:
-            area, status, note = CATALOG[name]
+            area, status, note = feature_status(rep, name)
             rows.append((STATUS_ORDER[status], area, name, status, len(v), len({o.module for o in v}), note, v))
     rows.sort(key=lambda r: (r[0], -r[4], r[1], r[2]))
     w("## Features by thin support\n")

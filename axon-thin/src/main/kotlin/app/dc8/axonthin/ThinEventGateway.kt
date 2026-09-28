@@ -48,10 +48,7 @@ class ThinEventGateway internal constructor(
     }
 
     /**
-     * Stores all queued events in one batch, then hands them to event handlers — per bean, in `@Order` order:
-     * - a single-event handler is invoked once per event it handles, in publication order;
-     * - a batch handler (`List<…>` parameter) is invoked once with all events it handles, in publication order.
-     * (Within one bean, single-event handlers run before its batch handlers; don't mix both for related events.)
+     * Stores all queued events in one batch, then hands them to event handlers (see [dispatch]).
      * Events published by the handlers themselves are stored and dispatched in the next round.
      */
     internal fun flush(uow: ThinUnitOfWork) {
@@ -64,8 +61,11 @@ class ThinEventGateway internal constructor(
     }
 
     /**
-     * Hands [events] to [beans], bean by bean in order: single-event handlers once per event, batch handlers once with
-     * all events they handle (both in the order of [events]). Shared by live chunks and projection replays.
+     * Hands [events] to [beans], bean by bean, **in event order**: consecutive events that go to the same batch handler
+     * (`List<…>` parameter) are delivered as one call; a single-event handler gets one call per event. So a bean mixing
+     * single and batch handlers still sees events in their original order, and bulk operations (long runs of events
+     * for one handler) arrive as large batches. Events a bean does not handle do not interrupt its runs.
+     * Shared by live chunks and projection replays.
      */
     internal fun dispatch(
         beans: List<ThinHandlerRegistry.EventHandlingBean>,
@@ -74,17 +74,27 @@ class ThinEventGateway internal constructor(
         mode: ThinAxonProperties.EventHandlerErrorMode,
     ) {
         for (bean in beans) {
-            val batches = LinkedHashMap<HandlerMethod, MutableList<EventMessage<*>>>()
+            var runHandler: HandlerMethod? = null
+            val run = ArrayList<EventMessage<*>>()
+            fun flushRun() {
+                val handler = runHandler ?: return
+                val batch = run.toList()
+                uow.handling(batch.last()) { guarded(mode, handler, "${batch.size} events") { handler.invokeBatch(batch) } }
+                runHandler = null
+                run.clear()
+            }
             for (event in events) {
                 val handler = bean.handlerFor(event.payloadType) ?: continue
-                if (handler.isBatch) batches.getOrPut(handler) { ArrayList() } += event
-                else uow.handling(event) { guarded(mode, handler, event.identifier) { handler.invoke(event) } }
-            }
-            for ((handler, batch) in batches) {
-                uow.handling(batch.last()) {
-                    guarded(mode, handler, "${batch.size} events") { handler.invokeBatch(batch) }
+                if (handler.isBatch) {
+                    if (handler !== runHandler) flushRun()
+                    runHandler = handler
+                    run += event
+                } else {
+                    flushRun()
+                    uow.handling(event) { guarded(mode, handler, event.identifier) { handler.invoke(event) } }
                 }
             }
+            flushRun()
         }
     }
 

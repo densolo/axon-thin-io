@@ -77,7 +77,7 @@ class Task() {
     fun handle(command: RenameTaskCommand) {
         require(command.title.isNotBlank()) { "Task title must not be blank" }
         ensureOpen()
-        if (title != command.title) apply(TaskRenamedEvent(command.taskId, command.title))
+        if (title != command.title) apply(TaskRenamedEvent(command.taskId, command.title, command.bulk))
     }
 
     /** Returns the previous status (non-Unit result through sendAllAndWait). */

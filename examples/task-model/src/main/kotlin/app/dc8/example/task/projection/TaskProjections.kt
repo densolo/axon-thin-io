@@ -11,6 +11,7 @@ import app.dc8.example.task.api.TaskEvent
 import app.dc8.example.task.api.TaskRenamedEvent
 import app.dc8.example.task.api.TaskStatus
 import app.dc8.example.task.api.TaskStatusChangedEvent
+import app.dc8.example.task.api.TasksBulkRenamedEvent
 import jakarta.persistence.Column
 import jakarta.persistence.Entity
 import jakarta.persistence.EnumType
@@ -91,8 +92,18 @@ class TaskSummaryProjection(private val summaries: TaskSummaryRepository) {
         summaries.save(TaskSummary(event.taskId, event.title, TaskStatus.TODO, event.createdBy))
     }
 
+    /** Flagged renames are part of a bulk operation: applied from its TasksBulkRenamedEvent instead. */
     @EventHandler
-    fun on(event: TaskRenamedEvent) = update(event.taskId) { title = event.title }
+    fun on(event: TaskRenamedEvent) {
+        if (!event.bulk) update(event.taskId) { title = event.title }
+    }
+
+    /** The bulk envelope: all renames in one read and one batched write. */
+    @EventHandler
+    fun on(event: TasksBulkRenamedEvent) {
+        val titles = event.renames.associate { it.taskId to it.title }
+        summaries.findAllById(titles.keys).forEach { it.title = titles.getValue(it.taskId) }
+    }
 
     @EventHandler
     fun on(event: TaskStatusChangedEvent) = update(event.taskId) { status = event.to }

@@ -1,6 +1,7 @@
 package app.dc8.axonthin
 
 import app.dc8.axonthin.api.ReplayInto
+import app.dc8.axonthin.eventstore.ReplayOrder
 import app.dc8.axonthin.eventstore.ThinEventStore
 import jakarta.persistence.EntityManagerFactory
 import org.slf4j.LoggerFactory
@@ -15,11 +16,18 @@ import org.springframework.util.ClassUtils
  * - all empty, but the store holds no event it handles → nothing to do;
  * - all empty and relevant events exist → replayed.
  *
- * All projections to replay are filled in one pass over the store, in `(aggregate_identifier, sequence_number)` order
- * (per-aggregate order guaranteed, same order on every run), in pages of [pageSize] events — one transaction per
- * page, delivered like live chunks (batch handlers receive the page's events as one list). Handler errors fail the
+ * All projections to replay are filled in one pass over the store, in pages of [pageSize] events — one transaction per
+ * page, delivered like live chunks (runs of events for one batch handler arrive as one list). Handler errors fail the
  * migration. Events published by handlers during the replay are dropped. Resetting a projection is up to the
  * application (e.g. a Liquibase change emptying or renaming its table).
+ *
+ * Order ([order]):
+ * - [ReplayOrder.GLOBAL] (default): `global_index`, the order events were appended — like live handling and Axon's
+ *   tracking replays; keeps patterns spanning aggregates (single events + a bulk event) in order. With pooled
+ *   sequence blocks (increment 50) and several writing processes, a later event of an aggregate can carry a lower
+ *   index: such inversions are detected, logged and counted in [Result.inversions]. A sequence increment of 1 avoids
+ *   them.
+ * - [ReplayOrder.PER_AGGREGATE]: strict per-aggregate order, aggregates one after another.
  */
 class ProjectionMigrator internal constructor(
     private val registry: ThinHandlerRegistry,
@@ -28,12 +36,23 @@ class ProjectionMigrator internal constructor(
     private val entityManagerFactory: EntityManagerFactory,
     private val transactions: ThinTransactions,
     private val pageSize: Int,
+    private val order: ReplayOrder = ReplayOrder.GLOBAL,
 ) {
     private val log = LoggerFactory.getLogger(ProjectionMigrator::class.java)
 
     enum class Outcome { REPLAYED, NOT_EMPTY, PARTIALLY_EMPTY, NO_EVENTS }
 
-    data class Result(val projection: String, val outcome: Outcome, val events: Long = 0, val millis: Long = 0)
+    /**
+     * @property inversions events that arrived after a later event of the same aggregate (GLOBAL order only): the
+     *   projection may hold an older state for those aggregates — the log names them.
+     */
+    data class Result(
+        val projection: String,
+        val outcome: Outcome,
+        val events: Long = 0,
+        val millis: Long = 0,
+        val inversions: Long = 0,
+    )
 
     fun migrate(): List<Result> {
         check(ThinUnitOfWork.currentOrNull() == null) { "migrate() must not run inside command or event handling" }
@@ -75,24 +94,46 @@ class ProjectionMigrator internal constructor(
     }
 
     private fun replay(beans: List<ThinHandlerRegistry.EventHandlingBean>, payloadTypes: Set<String>): List<Result> {
-        log.info("Replaying {} projection(s) {} from {} event type(s)", beans.size, beans.map { it.projectionName }, payloadTypes.size)
+        log.info(
+            "Replaying {} projection(s) {} from {} event type(s) in {} order",
+            beans.size, beans.map { it.projectionName }, payloadTypes.size, order,
+        )
         val started = System.currentTimeMillis()
         val counts = beans.associateWith { 0L }.toMutableMap()
-        var after: Pair<String, Long>? = null
+        val inversions = beans.associateWith { 0L }.toMutableMap()
+        val lastSequence = HashMap<String, Long>() // per aggregate, to detect out-of-order events (GLOBAL order)
+        var after: ThinEventStore.ReplayEvent? = null
         while (true) {
-            val page = store.readReplayPage(payloadTypes, after, pageSize)
+            val page = store.readReplayPage(payloadTypes, order, after, pageSize)
             if (page.isEmpty()) break
+            // detect inversions first: logged even if a handler then fails because of one
+            for (event in page) {
+                val message = event.message
+                val handledBy = beans.filter { it.handles(message.payloadType) }
+                handledBy.forEach { counts[it] = counts.getValue(it) + 1 }
+                if (message.type == null) continue // non-aggregate events have no sequence to violate
+                val previous = lastSequence.put(message.aggregateIdentifier, maxOf(message.sequenceNumber, lastSequence[message.aggregateIdentifier] ?: -1))
+                if (previous != null && previous > message.sequenceNumber) {
+                    handledBy.forEach { inversions[it] = inversions.getValue(it) + 1 }
+                    log.warn(
+                        "Replay out of order: aggregate [{}] event {} (global index {}) arrives after event {}; " +
+                            "projections {} may end with an older state for it",
+                        message.aggregateIdentifier, message.sequenceNumber, event.globalIndex, previous,
+                        handledBy.map { it.projectionName },
+                    )
+                }
+            }
+            val messages = page.map { it.message }
             transactions.inTransaction {
                 // a unit of work so handlers behave as in live dispatch; whatever they publish is never flushed
                 ThinUnitOfWork.joinOrStart { uow, _ ->
-                    eventGateway.dispatch(beans, page, uow, ThinAxonProperties.EventHandlerErrorMode.PROPAGATE)
+                    eventGateway.dispatch(beans, messages, uow, ThinAxonProperties.EventHandlerErrorMode.PROPAGATE)
                 }
             }
-            beans.forEach { bean -> counts[bean] = counts.getValue(bean) + page.count { bean.handles(it.payloadType) } }
-            after = page.last().let { it.aggregateIdentifier to it.sequenceNumber }
+            after = page.last()
         }
         val millis = System.currentTimeMillis() - started
-        return beans.map { Result(it.projectionName, Outcome.REPLAYED, counts.getValue(it), millis) }
+        return beans.map { Result(it.projectionName, Outcome.REPLAYED, counts.getValue(it), millis, inversions.getValue(it)) }
     }
 
     private fun isEmpty(entity: Class<*>): Boolean = entityManagerFactory.createEntityManager().use { em ->

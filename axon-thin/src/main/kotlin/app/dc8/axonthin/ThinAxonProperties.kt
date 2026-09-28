@@ -1,5 +1,6 @@
 package app.dc8.axonthin
 
+import app.dc8.axonthin.eventstore.ReplayOrder
 import org.springframework.boot.context.properties.ConfigurationProperties
 
 @ConfigurationProperties("axon.thin")
@@ -21,6 +22,9 @@ class ThinAxonProperties {
 
     /** ProjectionMigrator: events per page (one transaction per page). */
     var replayPageSize: Int = 1000
+
+    /** ProjectionMigrator: `global` (append order, default) or `per-aggregate`. */
+    var replayOrder: ReplayOrder = ReplayOrder.GLOBAL
 
     enum class EventHandlerErrorMode { LOG, PROPAGATE }
 

@@ -142,6 +142,34 @@ class ThinEngineTest {
         }
     }
 
+    data class Single(val n: Int)
+    data class Bulk(val n: Int)
+
+    /** Mixes a single-event handler and a batch handler: calls must follow event order. */
+    class MixedProjection(private val recorder: Recorder) {
+        @EventHandler
+        fun on(single: Single) {
+            recorder.seen += "single:${single.n}"
+        }
+
+        @EventHandler
+        fun on(bulk: List<Bulk>) {
+            recorder.seen += "batch:${bulk.map { it.n }}"
+        }
+    }
+
+    @Test
+    fun `batch handlers get runs of consecutive events, in event order with single handlers`() {
+        runner.withBean(Recorder::class.java).withBean(MixedProjection::class.java).run { ctx ->
+            ctx.getBean(EventGateway::class.java)
+                .publish(Bulk(1), Bulk(2), Single(1), Bulk(3), Single(2), Single(3), Bulk(4), Bulk(5))
+
+            assertThat(ctx.getBean(Recorder::class.java).seen).containsExactly(
+                "batch:[1, 2]", "single:1", "batch:[3]", "single:2", "single:3", "batch:[4, 5]",
+            )
+        }
+    }
+
     class DuplicateHandlers {
         @CommandHandler
         fun handle(@Suppress("UNUSED_PARAMETER") ping: Ping) = "dup"

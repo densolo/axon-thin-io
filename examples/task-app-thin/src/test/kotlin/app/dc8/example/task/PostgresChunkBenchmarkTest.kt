@@ -1,7 +1,7 @@
 package app.dc8.example.task
 
 import app.dc8.axonthin.api.BulkCommandGateway
-import app.dc8.example.task.ThinChunkPipelineTest.SqlRecorder
+import app.dc8.example.task.contract.SqlRecorder
 import app.dc8.example.task.api.CreateTaskCommand
 import app.dc8.example.task.api.RenameTaskCommand
 import app.dc8.example.task.contract.PostgresSupport

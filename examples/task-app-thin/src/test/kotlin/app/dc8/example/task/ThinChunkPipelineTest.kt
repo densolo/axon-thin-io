@@ -10,13 +10,11 @@ import app.dc8.example.task.api.TaskCreatedEvent
 import app.dc8.example.task.api.TaskEvent
 import app.dc8.example.task.api.TaskRenamedEvent
 import app.dc8.example.task.contract.PostgresSupport
+import app.dc8.example.task.contract.SqlCountingConfiguration
+import app.dc8.example.task.contract.SqlRecorder
 import app.dc8.example.task.contract.StoredEvents
 import app.dc8.example.task.domain.Task
 import app.dc8.example.task.query.TaskQueryService
-import net.ttddyy.dsproxy.ExecutionInfo
-import net.ttddyy.dsproxy.QueryInfo
-import net.ttddyy.dsproxy.listener.QueryExecutionListener
-import net.ttddyy.dsproxy.support.ProxyDataSourceBuilder
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.axonframework.commandhandling.CommandHandler
@@ -30,7 +28,6 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Qualifier
-import org.springframework.beans.factory.config.BeanPostProcessor
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.boot.test.context.TestConfiguration
 import org.springframework.context.annotation.Bean
@@ -44,7 +41,6 @@ import org.springframework.transaction.support.TransactionTemplate
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
-import javax.sql.DataSource
 
 /**
  * Thin-only chunk semantics (`sendAllAndWait`): set-based I/O, batch projections, end-of-chunk visibility and
@@ -279,28 +275,9 @@ class ThinChunkPipelineTest {
         }
     }
 
-    /** Every statement the application sends, with its JDBC batch size. */
-    class SqlRecorder : QueryExecutionListener {
-        private val executions = CopyOnWriteArrayList<Pair<String, Int>>()
-
-        override fun beforeQuery(execInfo: ExecutionInfo, queryInfoList: List<QueryInfo>) = Unit
-
-        override fun afterQuery(execInfo: ExecutionInfo, queryInfoList: List<QueryInfo>) {
-            queryInfoList.forEach { executions += it.query.trim().lowercase() to maxOf(1, execInfo.batchSize) }
-        }
-
-        fun clear() = executions.clear()
-
-        /** Round trips whose SQL matches. */
-        fun count(match: (String) -> Boolean): Int = executions.count { match(it.first) }
-
-        /** Rows sent by matching statements (JDBC batch size). */
-        fun rows(match: (String) -> Boolean): Int = executions.filter { match(it.first) }.sumOf { it.second }
-    }
-
     @TestConfiguration(proxyBeanMethods = false)
+    @Import(SqlCountingConfiguration::class)
     class Config {
-        @Bean fun sqlRecorder() = SqlRecorder()
         @Bean fun batchRecordingProjection() = BatchRecordingProjection()
         @Bean fun visibilityProbe(queries: TaskQueryService, chunk: ChunkContext) = VisibilityProbe(queries, chunk)
 
@@ -310,21 +287,6 @@ class ThinChunkPipelineTest {
             transactionManager: PlatformTransactionManager,
             @Qualifier("eventSerializer") serializer: Serializer,
         ) = Interference(jdbc, transactionManager, serializer)
-
-        companion object {
-            @JvmStatic
-            @Bean
-            fun countingDataSource(recorder: org.springframework.beans.factory.ObjectProvider<SqlRecorder>): BeanPostProcessor =
-                object : BeanPostProcessor {
-                    override fun postProcessAfterInitialization(bean: Any, beanName: String): Any =
-                        if (bean is DataSource && beanName == "dataSource") {
-                            ProxyDataSourceBuilder.create(bean).listener(object : QueryExecutionListener {
-                                override fun beforeQuery(e: ExecutionInfo, q: List<QueryInfo>) = Unit
-                                override fun afterQuery(e: ExecutionInfo, q: List<QueryInfo>) = recorder.getObject().afterQuery(e, q)
-                            }).build()
-                        } else bean
-                }
-        }
     }
 
     companion object {

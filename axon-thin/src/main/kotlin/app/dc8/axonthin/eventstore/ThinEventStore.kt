@@ -110,6 +110,15 @@ class ThinEventStore internal constructor(
     internal fun readEvents(aggregateIdentifier: String, fromSequence: Long = 0): List<DomainEventMessage<*>> =
         jdbc.query(readSql, { rs, _ -> toMessage(rs) }, aggregateIdentifier, fromSequence)
 
+    /** At most [limit] events of one aggregate from [fromSequence] (inclusive), in sequence order. */
+    internal fun readEvents(aggregateIdentifier: String, fromSequence: Long, limit: Int): List<DomainEventMessage<*>> =
+        jdbc.query("$readSql limit $limit", { rs, _ -> toMessage(rs) }, aggregateIdentifier, fromSequence)
+
+    /** Highest stored sequence number of an aggregate, if it has events. */
+    internal fun lastSequenceNumber(aggregateIdentifier: String): Long? = jdbc.queryForObject(
+        "select max(sequence_number) from $table where aggregate_identifier = ?", Long::class.javaObjectType, aggregateIdentifier,
+    )
+
     /**
      * Events of many aggregates, each after its own sequence number (e.g. its snapshot), in one query per
      * [MAX_IDS_PER_QUERY] aggregates: `join (values (?, ?), …) v(aggregate_identifier, after_seq)`.
@@ -133,19 +142,34 @@ class ThinEventStore internal constructor(
     internal fun distinctPayloadTypes(): List<String> =
         jdbc.queryForList("select distinct payload_type from $table", String::class.java)
 
+    /** A replayed event with its position in the table. */
+    internal class ReplayEvent(val globalIndex: Long, val message: DomainEventMessage<*>)
+
     /**
-     * One replay page: events of [payloadTypes] in `(aggregate_identifier, sequence_number)` order, after [after]
-     * (exclusive; `null` = from the start). Keyset pagination on the unique index: every page is a range scan.
-     * Per-aggregate order is guaranteed and the order is the same on every run.
+     * One replay page of events of [payloadTypes], after the last event of the previous page ([after], `null` = start):
+     * - [ReplayOrder.GLOBAL]: `global_index` order — the order events were appended, as Axon's tracking replay;
+     * - [ReplayOrder.PER_AGGREGATE]: `(aggregate_identifier, sequence_number)` order.
+     * Keyset pagination on an index in both cases, so every page is a range scan.
      */
-    internal fun readReplayPage(payloadTypes: Collection<String>, after: Pair<String, Long>?, limit: Int): List<DomainEventMessage<*>> {
+    internal fun readReplayPage(payloadTypes: Collection<String>, order: ReplayOrder, after: ReplayEvent?, limit: Int): List<ReplayEvent> {
         if (payloadTypes.isEmpty()) return emptyList()
         val types = payloadTypes.joinToString(", ") { "?" }
-        val keyset = if (after == null) "" else "and (aggregate_identifier > ? or (aggregate_identifier = ? and sequence_number > ?)) "
-        val sql = "select $columns from $table where payload_type in ($types) $keyset" +
-            "order by aggregate_identifier, sequence_number limit $limit"
-        val args: List<Any> = payloadTypes.toList() + (after?.let { listOf<Any>(it.first, it.first, it.second) } ?: emptyList())
-        return jdbc.query(sql, { rs, _ -> toMessage(rs) }, *args.toTypedArray())
+        val (keyset, keyArgs, orderBy) = when (order) {
+            ReplayOrder.GLOBAL -> Triple(
+                if (after == null) "" else "and global_index > ? ",
+                listOfNotNull<Any>(after?.globalIndex),
+                "global_index",
+            )
+            ReplayOrder.PER_AGGREGATE -> Triple(
+                if (after == null) "" else "and (aggregate_identifier > ? or (aggregate_identifier = ? and sequence_number > ?)) ",
+                after?.message?.let { listOf<Any>(it.aggregateIdentifier, it.aggregateIdentifier, it.sequenceNumber) } ?: emptyList(),
+                "aggregate_identifier, sequence_number",
+            )
+        }
+        val sql = "select global_index, $columns from $table where payload_type in ($types) $keyset" +
+            "order by $orderBy limit $limit"
+        val args: List<Any> = payloadTypes.toList() + keyArgs
+        return jdbc.query(sql, { rs, _ -> ReplayEvent(rs.getLong("global_index"), toMessage(rs)) }, *args.toTypedArray())
     }
 
     /** Latest readable snapshot of one aggregate. */
@@ -249,4 +273,13 @@ class ThinEventStore internal constructor(
         /** Keeps statements well below PostgreSQL's 32767 bind parameters. */
         const val MAX_IDS_PER_QUERY = 1000
     }
+}
+
+/** Order in which [ProjectionMigrator][app.dc8.axonthin.ProjectionMigrator] replays events. */
+enum class ReplayOrder {
+    /** `global_index`: append order — keeps multi-aggregate patterns (e.g. single events + a bulk event) in order. */
+    GLOBAL,
+
+    /** `(aggregate_identifier, sequence_number)`: strict per-aggregate order, aggregates one after another. */
+    PER_AGGREGATE,
 }

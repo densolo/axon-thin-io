@@ -20,7 +20,8 @@ data class CreateTaskCommand(val taskId: String, val title: String, val descript
 /** Upsert: `@CreationPolicy(CREATE_IF_MISSING)` — creates the task or renames an existing one. */
 data class ImportTaskCommand(@TargetAggregateIdentifier val taskId: String, val title: String)
 
-data class RenameTaskCommand(@TargetAggregateIdentifier val taskId: String, val title: String)
+/** `bulk = true`: part of a bulk operation whose projection update comes with a TasksBulkRenamedEvent. */
+data class RenameTaskCommand(@TargetAggregateIdentifier val taskId: String, val title: String, val bulk: Boolean = false)
 
 data class ChangeTaskStatusCommand(@TargetAggregateIdentifier val taskId: String, val status: TaskStatus)
 
@@ -60,7 +61,8 @@ data class TaskCreatedEvent(
     val createdBy: String?,
 ) : TaskEvent
 
-data class TaskRenamedEvent(override val taskId: String, val title: String) : TaskEvent
+/** `bulk = true`: projections that apply TasksBulkRenamedEvent skip it (the aggregate still needs it). */
+data class TaskRenamedEvent(override val taskId: String, val title: String, val bulk: Boolean = false) : TaskEvent
 
 data class TaskStatusChangedEvent(override val taskId: String, val from: TaskStatus, val to: TaskStatus) : TaskEvent
 
@@ -81,3 +83,11 @@ data class CommentDeletedEvent(override val taskId: String, val commentId: Strin
 
 /** Not an aggregate event: published through EventGateway (stored with type = null, sequence 0). */
 data class TasksImportedEvent(val count: Int, val source: String)
+
+/**
+ * Bulk envelope: one event carrying many renames, published directly to the EventStore (its own aggregate id,
+ * sequence 0) after the flagged per-aggregate TaskRenamedEvents — a pre-thin way to let projections write in batches.
+ */
+data class TasksBulkRenamedEvent(val renames: List<Rename>) {
+    data class Rename(val taskId: String, val title: String)
+}

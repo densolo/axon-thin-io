@@ -9,6 +9,7 @@ import app.dc8.example.task.api.CreateTaskCommand
 import app.dc8.example.task.api.DeleteCommentCommand
 import app.dc8.example.task.api.DeleteTaskCommand
 import app.dc8.example.task.api.RenameTaskCommand
+import app.dc8.example.task.api.TaskRenamedEvent
 import app.dc8.example.task.api.TaskStatus
 import app.dc8.example.task.contract.PostgresSupport
 import app.dc8.example.task.contract.StoredEvents
@@ -19,7 +20,9 @@ import org.assertj.core.api.Assertions.assertThat
 import org.axonframework.commandhandling.gateway.CommandGateway
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.axonframework.serialization.Serializer
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Qualifier
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.DynamicPropertyRegistry
@@ -41,6 +44,8 @@ class ThinProjectionMigrationTest {
     @Autowired lateinit var comments: CommentViewRepository
     @Autowired lateinit var activities: TaskActivityRepository
     @Autowired lateinit var jdbc: JdbcTemplate
+    @Autowired lateinit var bulkRename: TaskBulkRenameService
+    @Autowired @Qualifier("eventSerializer") lateinit var serializer: Serializer
     @Autowired lateinit var titles: TaskTitleIndexRepository // test-only batch projection, also @ReplayInto
 
     private val stored by lazy { StoredEvents(jdbc, "axon_domain_event_entry") }
@@ -136,6 +141,49 @@ class ThinProjectionMigrationTest {
         migrator.migrate()
 
         assertThat(summaryRows()).isEqualTo(live)
+    }
+
+    @Test
+    fun `the bulk pattern (flagged singles + bulk event) is rebuilt as live handling built it`() {
+        val ids = List(4) { id().also { taskId -> commandGateway.sendAndWait<String>(CreateTaskCommand(taskId, "t")) } }
+        bulkRename.renameAll(ids.associateWith { "bulk $it" })
+        commandGateway.sendAndWait<Any>(RenameTaskCommand(ids[0], "single after bulk"))
+        bulkRename.renameAll(mapOf(ids[1] to "second bulk"))
+        val live = summaryRows()
+        summaries.deleteAllInBatch()
+
+        val result = migrator.migrate().single { it.projection == "task-summary" }
+
+        assertThat(result.outcome).isEqualTo(Outcome.REPLAYED)
+        assertThat(result.inversions).isZero()
+        assertThat(summaryRows()).isEqualTo(live) // needs append order: the bulk events have their own aggregate ids
+    }
+
+    @Test
+    fun `an aggregate event stored with a lower global index than its predecessor is reported`() {
+        val taskId = id()
+        commandGateway.sendAndWait<String>(CreateTaskCommand(taskId, "created")) // seq 0
+        val base = jdbc.queryForObject("select max(global_index) from axon_domain_event_entry", Long::class.java)!!
+        // seq 1 and 2 as two processes with pooled blocks could store them: the later event gets the lower index
+        rawRename(taskId, sequence = 1, globalIndex = base + 1_000_000, title = "older (seq 1)")
+        rawRename(taskId, sequence = 2, globalIndex = base + 500_000, title = "newer (seq 2)")
+        summaries.deleteAllInBatch()
+
+        val result = migrator.migrate().single { it.projection == "task-summary" }
+
+        assertThat(result.inversions).isEqualTo(1)
+        // what the warning is about: replayed in index order, the older rename is applied last
+        assertThat(summaries.findById(taskId).orElseThrow().title).isEqualTo("older (seq 1)")
+    }
+
+    private fun rawRename(taskId: String, sequence: Long, globalIndex: Long, title: String) {
+        val payload = serializer.serialize(TaskRenamedEvent(taskId, title), ByteArray::class.java)
+        jdbc.update(
+            "insert into axon_domain_event_entry (global_index, event_identifier, payload_type, payload_revision, payload, " +
+                "meta_data, time_stamp, aggregate_identifier, sequence_number, type) values (?,?,?,?,?,?,?,?,?,?)",
+            globalIndex, id(), payload.type.name, payload.type.revision, payload.data, "{}".toByteArray(),
+            "2026-01-01T00:00:00.000Z", taskId, sequence, "Task",
+        )
     }
 
     companion object {

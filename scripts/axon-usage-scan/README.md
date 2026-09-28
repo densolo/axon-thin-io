@@ -35,3 +35,7 @@ Outputs `axon-usage.md` (summary, also printed) and `axon-usage.json` (full deta
 * **Unclassified**: Axon types not yet in `CATALOG`. Add them there with a status.
 
 When axon-thin gains a feature, update its entry in `CATALOG` so the report stays accurate.
+
+For types where thin supports only some methods (`METHOD_SUPPORT`, e.g. `AggregateLifecycle`: everything except
+`createNew`), the status comes from the calls actually found. The type is SUPPORTED unless your code calls an
+unsupported method, in which case the note names the call and its location.

@@ -2,17 +2,20 @@ package app.dc8.axonthin
 
 import app.dc8.axonthin.aggregate.ThinSnapshotter
 import app.dc8.axonthin.api.ChunkContext
+import app.dc8.axonthin.eventstore.EventStoreBrowser
 import app.dc8.axonthin.eventstore.GlobalIndexAllocator
+import app.dc8.axonthin.eventstore.ThinAxonEventStore
 import app.dc8.axonthin.eventstore.PooledSequenceAllocator
 import app.dc8.axonthin.eventstore.ThinEventStore
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.axonframework.commandhandling.gateway.CommandGateway
 import org.axonframework.eventsourcing.Snapshotter
+import org.axonframework.eventsourcing.eventstore.EventStore
 import org.axonframework.serialization.AnnotationRevisionResolver
 import org.axonframework.serialization.ChainingConverter
 import org.axonframework.serialization.Serializer
 import org.axonframework.serialization.json.JacksonSerializer
-import org.springframework.beans.factory.ListableBeanFactory
+import org.springframework.beans.factory.config.ConfigurableListableBeanFactory
 import org.springframework.beans.factory.ObjectProvider
 import org.springframework.beans.factory.annotation.Qualifier
 import org.springframework.boot.autoconfigure.AutoConfiguration
@@ -46,16 +49,43 @@ class ThinAxonAutoConfiguration {
     fun thinChunkContext(): ChunkContext = ThinChunkContext()
 
     /**
-     * Same serializer Axon's Spring Boot autoconfig builds for `axon.serializer.events=jackson`:
-     * JacksonSerializer on the `defaultAxonObjectMapper` bean, else the application's ObjectMapper,
-     * with AnnotationRevisionResolver (`@Revision`) and a ChainingConverter — so stored bytes are identical.
+     * The event serializer, resolved like Axon 4's Spring Boot autoconfig so stored bytes are identical:
+     * 1. a `Serializer` bean named or `@Qualifier`-ed `eventSerializer` (then this method is skipped);
+     * 2. else one named/qualified `messageSerializer`;
+     * 3. else the application's general `Serializer` bean (e.g. `@Bean @Qualifier("serializer") fun axonJacksonSerializer()`),
+     *    the `@Primary` one if there are several;
+     * 4. else what Axon builds for `jackson`: JacksonSerializer on the `defaultAxonObjectMapper` bean, else the primary
+     *    ObjectMapper, with AnnotationRevisionResolver and a ChainingConverter.
      */
     @Bean
     @Qualifier("eventSerializer")
     @ConditionalOnMissingBean(name = ["eventSerializer"])
-    fun eventSerializer(beanFactory: ListableBeanFactory): Serializer {
-        val mappers = beanFactory.getBeansOfType(ObjectMapper::class.java)
-        val objectMapper = mappers["defaultAxonObjectMapper"] ?: mappers.values.firstOrNull() ?: ObjectMapper().findAndRegisterModules()
+    fun eventSerializer(beanFactory: ConfigurableListableBeanFactory): Serializer =
+        applicationSerializer(beanFactory) ?: defaultSerializer(beanFactory)
+
+    private fun applicationSerializer(beanFactory: ConfigurableListableBeanFactory): Serializer? {
+        val candidates = beanFactory.getBeanNamesForType(Serializer::class.java, true, false)
+            .filter { it != "eventSerializer" } // this method's own bean
+            .associateWith { name -> setOfNotNull(name, beanFactory.findAnnotationOnBean(name, Qualifier::class.java)?.value) }
+        fun qualified(qualifier: String) = candidates.filterValues { qualifier in it }.keys.firstOrNull()
+        val name = qualified("eventSerializer") ?: qualified("messageSerializer") ?: run {
+            val general = candidates.keys.toList()
+            when {
+                general.size <= 1 -> general.firstOrNull()
+                else -> general.firstOrNull { beanFactory.getMergedBeanDefinition(it).isPrimary }
+                    ?: qualified("serializer")
+                    ?: error("Several Serializer beans $general: mark the one for events @Primary or name it eventSerializer")
+            }
+        }
+        return name?.let { beanFactory.getBean(it, Serializer::class.java) }
+    }
+
+    private fun defaultSerializer(beanFactory: ConfigurableListableBeanFactory): Serializer {
+        val objectMapper = beanFactory.getBeanProvider(ObjectMapper::class.java).let { mappers ->
+            (if (beanFactory.containsBean("defaultAxonObjectMapper")) beanFactory.getBean("defaultAxonObjectMapper", ObjectMapper::class.java) else null)
+                ?: mappers.ifUnique // the primary one when there are several
+                ?: ObjectMapper().findAndRegisterModules()
+        }
         return JacksonSerializer.builder()
             .revisionResolver(AnnotationRevisionResolver())
             .converter(ChainingConverter(javaClass.classLoader))
@@ -84,6 +114,21 @@ class ThinAxonAutoConfiguration {
             config.storeNonAggregateEvents,
         )
     }
+
+    /** Raw, paged read access to the event table (debug/admin pages). */
+    @Bean
+    @ConditionalOnBean(DataSource::class)
+    @ConditionalOnProperty(prefix = "axon.thin.event-store", name = ["enabled"], matchIfMissing = true)
+    @ConditionalOnMissingBean
+    fun eventStoreBrowser(dataSource: DataSource, properties: ThinAxonProperties): EventStoreBrowser =
+        EventStoreBrowser(JdbcTemplate(dataSource), properties.eventStore.domainEventTableName)
+
+    /** Axon's EventStore interface for application code that reads streams or publishes domain events directly. */
+    @Bean
+    @ConditionalOnBean(ThinEventStore::class)
+    @ConditionalOnMissingBean(EventStore::class)
+    fun thinAxonEventStore(eventStore: ThinEventStore, eventGateway: ThinEventGateway): EventStore =
+        ThinAxonEventStore(eventStore, eventGateway)
 
     /** Target of the application's `SnapshotTriggerDefinition` beans (they take a `Snapshotter`). */
     @Bean
@@ -142,6 +187,6 @@ class ThinProjectionMigratorAutoConfiguration {
         properties: ThinAxonProperties,
     ): ProjectionMigrator = ProjectionMigrator(
         registry, eventGateway, eventStore, entityManagerFactory,
-        ThinTransactions(transactionManager.ifAvailable), properties.replayPageSize,
+        ThinTransactions(transactionManager.ifAvailable), properties.replayPageSize, properties.replayOrder,
     )
 }

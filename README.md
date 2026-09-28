@@ -83,8 +83,10 @@ What that means for your code:
 - **Projections** receive the chunk's events only after its last command. **Validation inside a chunk** must
   therefore consider the chunk's own changes, not only the projections.
 - **Batch handlers:** `@EventHandler fun on(events: List<EventMessage<ContainerEvent>>)` (or `List<ContainerEvent>`)
-  receives every event it handles, in publication order, once per chunk. Existing single-event handlers are called
-  once per event. Each handler bean receives the whole chunk before the next bean does.
+  receives the events it handles in **runs**: consecutive events for the same batch handler arrive as one call.
+  Single-event handlers are called once per event, and a bean mixing both still sees everything in event order.
+  Bulk operations produce long runs, so they arrive as large batches. Each handler bean receives the whole chunk
+  before the next bean does.
 - **All-or-nothing:** the first failure rolls the chunk back. Jobs size their chunks (for example 100–500).
 - **Concurrent writers:** if another writer appended to one of the chunk's aggregates first, the unique index
   raises `ConcurrencyException`. `BulkOptions(concurrencyRetries = n)` (or `axon.thin.concurrency-retries`) re-runs
@@ -121,8 +123,17 @@ on the PostgreSQL URL.
 ### Storage compatibility
 
 Rows are written exactly like Axon's `JpaEventStorageEngine` writes them:
-- **Payload and metadata:** JSON bytes from Axon's `JacksonSerializer`. Thin looks up the `ObjectMapper` the same
-  way Axon's autoconfig does: `defaultAxonObjectMapper`, else the application's `ObjectMapper`.
+- **Payload and metadata:** JSON bytes from the same serializer Axon 4 would use. Thin resolves it like Axon's
+  Spring Boot autoconfig:
+  1. a `Serializer` bean named or qualified `eventSerializer`;
+  2. else `messageSerializer`;
+  3. else **your general `Serializer` bean**, for example
+     `@Bean @Primary @Qualifier("serializer") fun axonJacksonSerializer(objectMapper: ObjectMapper) = JacksonSerializer.builder().objectMapper(objectMapper.copy()…)`
+     (the `@Primary` one if there are several);
+  4. else a `JacksonSerializer` on `defaultAxonObjectMapper` or the primary `ObjectMapper`.
+
+  The contract suite checks this with such a bean, whose extra Jackson module changes the JSON: both engines store
+  identical bytes.
 - **Type and revision:** `payload_type` is the class name, and `payload_revision` comes from `@Revision`.
 - **Timestamp:** `time_stamp` is ISO-8601 with milliseconds.
 - **Aggregate columns:** `type` is the aggregate type, and `sequence_number` the aggregate sequence.
@@ -210,13 +221,56 @@ For each `@ReplayInto` projection, `migrate()` does this:
 - **Relevant event types:** found with one `select distinct payload_type` (an index on `payload_type` makes it
   instant), and matched against the projection's handlers, including supertype handlers. Types this code can't load,
   for example ones from another branch, are skipped.
-- **One pass for all:** every projection to replay is filled in a single pass. The pass goes in
-  `(aggregate_identifier, sequence_number)` order (per-aggregate order guaranteed, the same order on every run), in
-  pages of `axon.thin.replay-page-size` events (default 1000), one transaction per page. Pages are delivered like live
-  chunks: batch handlers get each page as one list.
+- **One pass for all:** every projection to replay is filled in a single pass, in pages of
+  `axon.thin.replay-page-size` events (default 1000), one transaction per page. Pages are delivered like live chunks
+  (runs per batch handler).
+- **Order (`axon.thin.replay-order`):**
+  - `global` (the default) is `global_index` order: the order events were appended, like live handling and Axon's
+    tracking replays. It keeps patterns that span aggregates in order, such as flagged single events plus a bulk
+    event with its own aggregate id.
+  - `per-aggregate` is `(aggregate_identifier, sequence_number)` order: strict per-aggregate order, aggregates one
+    after another.
+- **Inversions (`global` only):** with pooled sequence blocks and several writing processes, an aggregate's later
+  event can carry a lower index. The replay detects this *before* dispatching each page, logs the aggregate id and
+  both positions, and reports it in `Result.inversions`. **A sequence increment of 1 prevents it:** a writer can
+  only write an aggregate's next event after its previous one is committed, so it always draws a higher index.
+  Once every process runs thin, use `alter sequence … increment by 1` plus
+  `axon.thin.event-store.global-index.allocation-size: 1`. It costs no extra round trips, because thin fetches all
+  values a chunk needs in one query.
 - **Handler failures** fail the migration. Events published by handlers during a replay are dropped.
 - **Resetting is up to you.** To rebuild a projection, empty or rename its table (for example a Liquibase change that
   switches to `task_summary_v3`); the next `migrate()` fills it. Beans without `@ReplayInto` are never replayed.
+
+### Using the event store directly
+
+For code that talks to the event store itself:
+- **`EventStore` (Axon's interface)** is provided as a bean:
+  - `readEvents(id)` works like Axon's: the latest snapshot first, then the events after it, then events of that
+    aggregate still pending in the running chunk. It reads lazily, 100 rows at a time.
+  - `readEvents(id, firstSequence)` returns the events from that sequence, without the snapshot.
+  - `publish(…)` stores a `DomainEventMessage` exactly as given (aggregate id, sequence number, type) and dispatches
+    it like any other event.
+  - `lastSequenceNumberFor` and `storeSnapshot` work as in Axon.
+  - The tracking methods (`openStream`, tokens) and `subscribe` throw `UnsupportedOperationException`.
+- **`EventStoreBrowser`** is for debug and admin pages. It returns raw rows, with payload and metadata as JSON text
+  and nothing deserialized, so it also lists event types the code no longer knows. It pages by keyset:
+  ```kotlin
+  browser.aggregate(id, afterSequence = lastSeenSequence, limit = 50)          // one stream, page by page
+  browser.latest(limit = 50, beforeGlobalIndex = lastSeenIndex, filter = EventStoreBrowser.Filter(aggregateType = "Task"))
+  ```
+
+**The pre-thin bulk pattern keeps working unchanged**, verified on both engines (`TaskBulkRenameService`):
+- rename commands flagged `bulk = true`, recorded on the events so the aggregates stay correct;
+- then one `GenericDomainEventMessage("BulkTaskRename", "BulkTaskRename-<uuid>", 0, TasksBulkRenamedEvent(…))`
+  published to the `EventStore`;
+- the summary projection skips flagged singles and applies the bulk event in one batch.
+
+Creating an aggregate by publishing its first event directly also works. Replays use `global` order, so the bulk
+events stay in place.
+
+On thin the pattern is **no longer needed**: a batch handler gets the same effect (the benchmark shows 11 round trips
+either way) without the flag and the extra event. Convert projections at your own pace. Converted projections
+replay correctly in either order.
 
 ### Processing groups
 
@@ -248,8 +302,9 @@ come from.
 - **No tracking processors.** Nothing reads the event store by `global_index` position, and `token_entry` is not
   used. A stale row left there by an old Axon processor is harmless.
 - **Queries go directly to repositories or services.** There is no `QueryGateway`.
-- **Projections are independent across aggregates.** A projection only needs per-aggregate event order (replays
-  rely on this).
+- **Projections tolerate replays in append order.** Replays use `global_index` order, which matches live handling
+  unless several processes wrote with pooled sequence blocks (see *Inversions*); `per-aggregate` order is available
+  for projections that are independent across aggregates.
 
 **Data and schema**
 - **Unique index on `(aggregate_identifier, sequence_number)`.** It is the only concurrency guard. An orm.xml
@@ -287,7 +342,7 @@ is the arbiter.
 | Read-model rows shared by several aggregates (totals, counters) | Updates from two transactions can overwrite each other | `@Version` on the entity, or atomic `update … set x = x + 1` |
 | Per-aggregate read-model rows | Safe: they're written in the writer's transaction, in sequence order | — |
 | Event-handler side effects (email, messages) | They run inside the transaction; after a rollback they have still happened, and after a retry they happen twice | Outbox table, or send after commit |
-| `global_index` order | Each process draws its own blocks of 50, so the index is **not** in commit order (≈5 % inversions measured) | Irrelevant without tracking readers; replays use per-aggregate order |
+| `global_index` order | Each process draws its own blocks of 50, so an aggregate's later event can get a lower index (≈5 % inversions measured) | Matters for `global`-order replays, which detect and report it. Use a sequence increment of 1 once all processes run thin. |
 | Snapshots from both processes | Duplicates are ignored, older snapshots replaced | — |
 
 `PostgresConcurrencyTest` covers this. Two application contexts (a "backend" with two users, and "jobs" with chunks of
@@ -315,7 +370,25 @@ network latency. On a real network every round trip adds latency, which makes th
 | rename 1k, one chunk | 1 | 1,000 | 329 | 0.33 | 4 | 1,010 | 11 | 30 |
 | create 10k, chunks of 500 | 20 | 10,000 | 2,330 | 0.23 | 40 | 10,100 | 120 | 300 |
 
-What it shows:
+**Axon 4 vs axon-thin, same scenarios** (`EngineBenchmark`, run by both apps:
+`mvn test -Ppostgres -pl examples/task-app-axon4,examples/task-app-thin -Dtest='*EngineBenchmarkTest'`):
+
+| engine | scenario | ms | event store | `task_summary` | `task_title_index` (batch, thin only) | other |
+|---|---|---:|---:|---:|---:|---:|
+| Axon 4 | create 1k: commands, one chunk | 2,435 | 1,020 | 2,000 | — | 1,020 |
+| Axon 4 | rename 1k: commands, one chunk | 4,358 | 3,020 | 2,000 | — | 1,020 |
+| Axon 4 | rename 1k: bulk pattern (flagged + bulk event) | 3,021 | 3,021 | 11 | — | 1,020 |
+| axon-thin | create 1k: commands, one chunk | 409 | 2 | 1,010 | 11 | 30 |
+| axon-thin | rename 1k: commands, one chunk | 542 | 4 | 1,010 | 11 | 30 |
+| axon-thin | rename 1k: bulk pattern (flagged + bulk event) | 269 | 5 | 11 | 11 | 30 |
+
+- **Axon 4 pays per command:** a snapshot read, an event read and an insert for each command, and projection writes
+  flushed per command (no JDBC batching).
+- **Thin pays per chunk:** 6–8× faster on the same code.
+- **The bulk pattern and a batch projection cost the same on thin** (11 round trips): the pattern is no longer
+  needed.
+
+What it shows (thin-only table above):
 - **The event store costs a constant number of round trips per chunk:** 2 for creates (index + insert), 4 for
   updates (+ snapshots + events), whatever the chunk size.
 - **A per-event projection costs about one round trip per command.** One `findById` or merge per event dominates
@@ -340,13 +413,14 @@ What it shows:
 **Deliberate differences from Axon 4**
 - **Chunk visibility:** projections see a chunk's events only after its last command. Validation uses `ChunkContext`
   for what the chunk did so far.
-- **Dispatch order:** each handler bean receives a whole chunk before the next bean does (Axon dispatches event by
-  event across beans).
+- **Dispatch order:** each handler bean receives a whole chunk (in event order, runs batched per batch handler) before
+  the next bean does. Axon dispatches event by event across beans.
 - **Batch `@EventHandler(List<…>)` handlers** exist only in thin.
 - **Unreadable snapshots** are skipped (full replay) instead of failing the command.
 - **Duplicate command handlers** fail at startup instead of being logged.
 - **`@ProcessingGroup` is ignored**, and there are no tracking tokens.
-- **Replay order** is per aggregate, not `global_index`.
+- **Replays** run only through `ProjectionMigrator` (no tracking processors). They use `global_index` order by
+  default, with inversion detection.
 
 **Operational notes**
 - **No locking:** heavy overlap between jobs and users on the same aggregates means more retries (see above).
@@ -496,7 +570,8 @@ axon:
 | Axon 4 code | On thin | Change to |
 |---|---|---|
 | `EventProcessingConfigurer` / `Configurer` / `ConfigurerModule` customization (`registerSubscribingEventProcessor`, error handlers, …) | the beans don't exist: **startup fails** on an injection point | delete it; use `axon.thin.event-handler-error-mode` for the error handler |
-| injecting `EventBus` / `EventStore` | not provided | `EventGateway.publish(…)` |
+| injecting `EventStore` | provided: `readEvents`, `publish`, `lastSequenceNumberFor`, `storeSnapshot` | nothing, unless you use tracking methods |
+| injecting `EventBus` | not provided | `EventStore` or `EventGateway.publish(…)` |
 | injecting `CommandBus` | not provided | `CommandGateway` |
 | `Repository<T>` (`load(id).execute { … }`) | not provided | send a command to the aggregate |
 | `QueryGateway` / `@QueryHandler` | not supported | call the service or repository directly |
