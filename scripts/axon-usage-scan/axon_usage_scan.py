@@ -121,7 +121,7 @@ CATALOG: dict[str, tuple[str, str, str]] = {
     "ConflictResolver": ("aggregates", M, ""),
     "Snapshotter": ("snapshots", S, "ThinSnapshotter bean replaces SpringAggregateSnapshotter; after commit, own transaction"),
     "SnapshotTriggerDefinition": ("snapshots", S, "your beans are reused as-is via @Aggregate(snapshotTriggerDefinition)"),
-    "EventStore": ("event-store", P, "Axon-compatible JDBC store, not exposed as EventStore"),
+    "EventStore": ("event-store", S, "bean provided: readEvents (snapshot first), publish, lastSequenceNumberFor, storeSnapshot; no tracking"),
     "EventStorageEngine": ("event-store", P, "built-in JDBC engine; Axon tables"),
     "JpaEventStorageEngine": ("event-store", S, "same tables/rows; prefix via axon.thin.event-store.table-prefix"),
     "JdbcEventStorageEngine": ("event-store", P, "check column names: thin uses the JPA (snake_case) layout"),
@@ -171,6 +171,202 @@ CATALOG: dict[str, tuple[str, str, str]] = {
 METHOD_SUPPORT: dict[str, tuple[set[str], set[str]]] = {
     "AggregateLifecycle": ({"apply", "markDeleted", "isLive", "getVersion"}, {"createNew"}),
 }
+
+# --------------------------------------------------------------------------------------------------------------------
+# What to do with each type when migrating to thin. Prefixes:
+#   keep       works unchanged on thin
+#   keep+api   unchanged; optionally adopt a thin API from axon-thin-api — it also works on Axon 4 through
+#              axon-thin-v4-adapter, so it can be adopted before switching
+#   replace    use the named thin/Spring equivalent
+#   remove     Axon engine configuration: fails or is meaningless on thin
+#   redesign   not supported by thin
+# --------------------------------------------------------------------------------------------------------------------
+_KEEP = "keep"
+MIGRATION: dict[str, str] = {
+    # commands
+    "CommandGateway": "keep+api: loops of sendAndWait → BulkCommandGateway.sendAllAndWait (api; v4-adapter on Axon)",
+    "CommandBus": "replace: inject CommandGateway",
+    "CommandGatewayFactory": "replace: inject CommandGateway",
+    "Timeout": "replace: plain CommandGateway (thin handles commands synchronously)",
+    "IntervalRetryScheduler": "replace: BulkOptions(concurrencyRetries) / axon.thin.concurrency-retries (api; v4-adapter on Axon)",
+    "RetryScheduler": "replace: BulkOptions(concurrencyRetries) / axon.thin.concurrency-retries (api; v4-adapter on Axon)",
+    "RoutingKey": "keep (ignored: local bus)",
+    # events and projections
+    "EventHandler": "keep; later: hot projections → batch handler List<…> (thin only) + @ReplayInto (api)",
+    "EventGateway": _KEEP,
+    "EventBus": "replace: EventStore (readEvents/publish) or EventGateway.publish",
+    "EventStore": "keep: readEvents/publish supported; debug pages → EventStoreBrowser (thin); bulk envelopes → batch handlers",
+    "ProcessingGroup": "keep (ignored); add @ReplayInto (api) to projections you want rebuildable",
+    "EventProcessingConfigurer": "remove before switch (startup fails on thin); error handler → axon.thin.event-handler-error-mode",
+    "SubscribingEventProcessor": "remove processor config (everything is subscribing)",
+    "TrackingEventProcessor": "redesign: subscribing only (projections in the command's transaction)",
+    "PooledStreamingEventProcessor": "redesign: subscribing only (projections in the command's transaction)",
+    "TrackingEventProcessorConfiguration": "remove",
+    "ListenerInvocationErrorHandler": "remove; axon.thin.event-handler-error-mode=log|propagate",
+    "PropagatingErrorHandler": "remove; axon.thin.event-handler-error-mode=propagate",
+    "LoggingErrorHandler": "remove; axon.thin.event-handler-error-mode=log (default)",
+    "ErrorHandler": "remove; axon.thin.event-handler-error-mode",
+    "SequencingPolicy": "remove (no parallel processors)",
+    "SequentialPerAggregatePolicy": "remove (no parallel processors)",
+    "ResetHandler": "leave (not called); rebuilds: empty the table + ProjectionMigrator.migrate()",
+    "AllowReplay": "leave (ignored)",
+    "DisallowReplay": "leave (ignored); only @ReplayInto projections are ever replayed",
+    "ReplayStatus": "leave (ignored)",
+    # parameters and messages
+    "ConcludesBatch": "redesign: a batch handler List<…> sees the whole batch",
+    # interceptors, correlation, unit of work
+    "MessageHandlerInterceptor": "redesign: move to the service calling the gateway, or a Spring aspect",
+    "CommandHandlerInterceptor": "redesign: move into the command handlers",
+    "ExceptionHandler": "redesign: handle in the command handler / caller",
+    "InterceptorChain": "redesign: see MessageHandlerInterceptor",
+    "CorrelationDataProvider": "replace: MessageDispatchInterceptor adding metadata (correlationId/traceId are built in)",
+    "SimpleCorrelationDataProvider": "replace: MessageDispatchInterceptor adding metadata",
+    "MultiCorrelationDataProvider": "replace: MessageDispatchInterceptor adding metadata",
+    "UnitOfWork": "replace: ChunkContext (api; v4-adapter on Axon) or Spring TransactionSynchronization",
+    "CurrentUnitOfWork": "replace: ChunkContext (api; v4-adapter on Axon) or Spring TransactionSynchronization",
+    "DefaultUnitOfWork": "replace: a Spring transaction around gateway calls",
+    "TransactionManager": "remove (Spring's PlatformTransactionManager is used directly)",
+    "SpringTransactionManager": "remove (Spring's PlatformTransactionManager is used directly)",
+    # aggregates
+    "AggregateVersion": "keep (read-only; getVersion() for the current sequence)",
+    "AggregateMember": "redesign: fold into the aggregate or make it its own aggregate",
+    "EntityId": "redesign: with @AggregateMember",
+    "TargetAggregateVersion": "redesign: compare the version in the command handler",
+    "ConflictResolver": "redesign: retry via BulkOptions(concurrencyRetries)",
+    "Repository": "replace: send a command to the aggregate",
+    "GenericJpaRepository": "redesign: state-stored aggregates unsupported (event-source it or use plain JPA)",
+    "EventSourcingRepository": "replace: send a command to the aggregate",
+    # event store, snapshots, serialization
+    "EmbeddedEventStore": "remove bean definitions; thin provides the EventStore bean",
+    "EventStorageEngine": "remove bean definitions; configure axon.thin.event-store.*",
+    "JpaEventStorageEngine": "remove bean definitions; configure axon.thin.event-store.*",
+    "JdbcEventStorageEngine": "remove bean definitions; configure axon.thin.event-store.* (check column names)",
+    "DomainEventEntry": "keep only if orm.xml/ddl-auto still needs Axon's entities",
+    "SnapshotEventEntry": "keep only if orm.xml/ddl-auto still needs Axon's entities",
+    "TokenStore": "remove (no tracking tokens)",
+    "JpaTokenStore": "remove (no tracking tokens)",
+    "Snapshotter": "keep injecting it (thin provides one); remove your own Snapshotter bean definitions",
+    "AggregateSnapshotter": "remove bean definitions (thin provides the Snapshotter)",
+    "SpringAggregateSnapshotter": "remove bean definitions (thin provides the Snapshotter)",
+    "SnapshotFilter": "leave (ignored)",
+    "Serializer": "keep; the event serializer bean must be @Primary or named serializer/eventSerializer",
+    "XStreamSerializer": "replace: JacksonSerializer (same bytes needed: only if nothing stored uses XStream)",
+    "Upcaster": "redesign: evolve events additively (no upcasters)",
+    "EventUpcaster": "redesign: evolve events additively (no upcasters)",
+    "SingleEventUpcaster": "redesign: evolve events additively (no upcasters)",
+    # sagas, deadlines, queries
+    "Saga": "redesign: a service reacting in an event handler, state in a table",
+    "SagaEventHandler": "redesign: see Saga",
+    "StartSaga": "redesign: see Saga",
+    "EndSaga": "redesign: see Saga",
+    "SagaLifecycle": "redesign: see Saga",
+    "SagaStore": "redesign: see Saga",
+    "DeadlineManager": "redesign: a scheduler (e.g. Spring @Scheduled / db-scheduler) sending commands",
+    "DeadlineHandler": "redesign: a scheduler sending commands",
+    "EventScheduler": "redesign: a scheduler publishing events",
+    "QueryGateway": "replace: call the service/repository directly",
+    "QueryHandler": "replace: plain service method",
+    "QueryBus": "replace: call the service/repository directly",
+    "QueryUpdateEmitter": "redesign: no subscription queries",
+    "ResponseTypes": "replace: call the service/repository directly",
+    "SubscriptionQueryResult": "redesign: no subscription queries",
+    # configuration and infrastructure
+    "Configurer": "remove before switch (Axon configuration API)",
+    "Configuration": "remove before switch (Axon configuration API)",
+    "ConfigurerModule": "remove before switch (Axon configuration API)",
+    "EventProcessorInfoConfiguration": "remove",
+    "AxonServerConfiguration": "remove (no Axon Server)",
+    "SpanFactory": "remove (no Axon tracing)",
+    "MessageMonitor": "remove (no Axon metrics)",
+    "HandlerDefinition": "redesign: custom handler definitions unsupported",
+    "HandlerEnhancerDefinition": "redesign: custom handler enhancers unsupported",
+    "ParameterResolverFactory": "redesign: custom parameter resolvers unsupported (Spring-bean parameters work)",
+}
+
+# calls whose migration differs from their type's note
+CALL_MIGRATION: dict[str, str] = {
+    "CommandGateway.sendAndWait": "keep; in loops → BulkCommandGateway.sendAllAndWait (api; v4-adapter on Axon)",
+    "CommandGateway.send": "keep (completes synchronously on thin)",
+    "EventStore.readEvents": "keep (snapshot first, like Axon); debug pages → EventStoreBrowser (thin)",
+    "EventStore.publish": "keep (stored as given); bulk envelopes → batch handlers after the switch",
+    "EventStore.lastSequenceNumberFor": _KEEP,
+    "EventStore.storeSnapshot": _KEEP,
+    "EventStore.openStream": "redesign: no tracking",
+    "EventBus.publish": "replace: EventStore.publish or EventGateway.publish",
+    "AggregateLifecycle.createNew": "redesign: send a command creating the other aggregate",
+    "GenericEventMessage.asEventMessage": _KEEP,
+    "GenericCommandMessage.asCommandMessage": _KEEP,
+    "MetaData.with": _KEEP,
+}
+
+# @Bean factories returning these stay; other Axon infrastructure beans are engine customization
+# Maven/Gradle artifacts (artifactId, prefix match)
+DEPENDENCY_MIGRATION: list[tuple[str, str]] = [
+    ("axon-spring-boot-starter", "replace with app.dc8:axon-thin in deployables (must not stay next to it)"),
+    ("axon-spring-boot-autoconfigure", "remove (the Axon engine)"),
+    ("axon-server-connector", "remove (no Axon Server)"),
+    ("axon-bom", "keep at 4.13.2 (or remove): it overrides the Axon versions axon-thin brings"),
+    ("axon-micrometer", "remove (no Axon metrics)"),
+    ("axon-metrics", "remove (no Axon metrics)"),
+    ("axon-tracing", "remove (no Axon tracing)"),
+    ("axon-test", "keep (test scope; AggregateTestFixture needs no engine)"),
+    ("axon-kotlin", "keep if used (gateway extension functions work)"),
+    ("axon-messaging", "keep (model modules: provided); deployables get it through axon-thin"),
+    ("axon-modelling", "keep (model modules: provided); deployables get it through axon-thin"),
+    ("axon-eventsourcing", "keep (model modules: provided); deployables get it through axon-thin"),
+    ("axon-spring", "keep (model modules: provided); deployables get it through axon-thin"),
+    ("axon-configuration", "keep only for types (@ProcessingGroup); Configurer usage must go"),
+    ("axon-springcloud", "remove (no distributed command bus)"),
+    ("axon-jgroups", "remove (no distributed command bus)"),
+]
+
+
+def dependency_migration(coordinates: str) -> str:
+    artifact = coordinates.split(":")[-1]
+    return next((note for prefix, note in DEPENDENCY_MIGRATION if artifact.startswith(prefix)), "check")
+
+
+KEEP_BEANS = {"Serializer", "SnapshotTriggerDefinition", "EventCountSnapshotTriggerDefinition",
+              "AggregateLoadTimeSnapshotTriggerDefinition", "MessageDispatchInterceptor"}
+
+
+def migration_note(rep: "Report", name: str) -> str:
+    if name in METHOD_SUPPORT:  # judged by the calls found
+        _, unsupported = METHOD_SUPPORT[name]
+        used = {call.split(".", 1)[1] for call in rep.member_calls if call.startswith(name + ".")}
+        blocked = sorted(used & unsupported)
+        return f"redesign {', '.join(m + '()' for m in blocked)}; keep the rest" if blocked else _KEEP
+    if name in MIGRATION:
+        return MIGRATION[name]
+    status = CATALOG.get(name, ("", "", ""))[1]
+    return {S: _KEEP, P: "check the note", M: "redesign", NA: "remove or leave (ignored by thin)"}.get(status, "check")
+
+
+def call_migration(rep: "Report", call: str) -> str:
+    if call in CALL_MIGRATION:
+        return CALL_MIGRATION[call]
+    owner = call.split(".", 1)[0]
+    if owner in METHOD_SUPPORT:
+        return "redesign" if call.split(".", 1)[1] in METHOD_SUPPORT[owner][1] else _KEEP
+    return migration_note(rep, owner) if owner in CATALOG else "check"
+
+
+def shape_migration(shape: str, status: str) -> str:
+    if "@Saga" in shape:
+        return "redesign: see Saga"
+    if "UnitOfWork" in shape:
+        return "replace: ChunkContext (api; v4-adapter on Axon) or Spring TransactionSynchronization"
+    if "InterceptorChain" in shape:
+        return "redesign: see MessageHandlerInterceptor"
+    return _KEEP if status == S else "check: parameter type not resolved by thin"
+
+
+def bean_migration(rep: "Report", type_name: str) -> str:
+    if type_name in KEEP_BEANS:
+        return _KEEP + (" (must be @Primary or named serializer/eventSerializer)" if type_name == "Serializer" else "")
+    note = migration_note(rep, type_name)
+    return note if not note.startswith(("keep", "check")) else "remove before switch (engine customization)"
+
 
 # Annotations whose methods we treat as handlers (signature details are captured).
 HANDLER_ANNOTATIONS = {
@@ -745,10 +941,12 @@ def to_json(rep: Report, examples: int) -> dict:
         "files_scanned": rep.files_scanned,
         "files_with_axon": rep.files_with_axon,
         "modules": dict(rep.modules.most_common()),
-        "dependencies": {k: sorted(v) for k, v in sorted(rep.dependencies.items())},
+        "dependencies": {k: {"files": sorted(v), "migration": dependency_migration(k)}
+                         for k, v in sorted(rep.dependencies.items())},
         "features": {
             name: {
                 **dict(zip(("area", "thin", "note"), feature_status(rep, name))),
+                "migration": migration_note(rep, name),
                 "annotation_targets": dict(rep.annotations.get(name, {})),
                 "modules": dict(Counter(o.module for o in v)),
                 **occs(v),
@@ -756,13 +954,15 @@ def to_json(rep: Report, examples: int) -> dict:
             for name, v in sorted(rep.names.items()) if name in CATALOG
         },
         "unclassified": {k: occs(v) for k, v in sorted(rep.unclassified.items())},
-        "member_calls": {k: occs(v) for k, v in sorted(rep.member_calls.items(), key=lambda kv: -len(kv[1]))},
+        "member_calls": {k: {**occs(v), "migration": call_migration(rep, k)}
+                         for k, v in sorted(rep.member_calls.items(), key=lambda kv: -len(kv[1]))},
         "supertypes": {k: occs(v) for k, v in rep.supertypes.items()},
-        "bean_overrides": {k: occs(v) for k, v in rep.bean_overrides.items()},
+        "bean_overrides": {k: {**occs(v), "migration": bean_migration(rep, k)} for k, v in rep.bean_overrides.items()},
         "config_keys": {k: occs(v) for k, v in sorted(rep.config_keys.items())},
         "orm_overrides": rep.orm_overrides,
         "handler_findings": [
-            {"shape": k, "thin": s, "count": c, "examples": [o.__dict__ for o in v[:examples]]}
+            {"shape": k, "thin": s, "migration": shape_migration(k, s), "count": c,
+             "examples": [o.__dict__ for o in v[:examples]]}
             for k, s, c, v in handler_findings(rep)
         ],
         "handlers": rep.handlers,
@@ -788,31 +988,34 @@ def to_markdown(rep: Report, examples: int) -> str:
             rows.append((STATUS_ORDER[status], area, name, status, len(v), len({o.module for o in v}), note, v))
     rows.sort(key=lambda r: (r[0], -r[4], r[1], r[2]))
     w("## Features by thin support\n")
-    w("| status | area | Axon type | refs | modules | note | examples |")
-    w("|---|---|---|---:|---:|---|---|")
+    w("Migration: **keep** unchanged · **keep+api** optional thin API (axon-thin-api; works on Axon via axon-thin-v4-adapter, "
+      "so it can be adopted before switching) · **replace** with the named equivalent · **remove** engine config before "
+      "switching · **redesign** unsupported.\n")
+    w("| status | area | Axon type | refs | modules | migration | note | examples |")
+    w("|---|---|---|---:|---:|---|---|---|")
     for _, area, name, status, n, mods, note, v in rows:
         targets = rep.annotations.get(name)
         tgt = f" ({', '.join(f'{k}:{c}' for k, c in targets.items())})" if targets else ""
-        w(f"| {status} | {area} | `{name}`{tgt} | {n} | {mods} | {note} | {ex(v)} |")
+        w(f"| {status} | {area} | `{name}`{tgt} | {n} | {mods} | {migration_note(rep, name)} | {note} | {ex(v)} |")
 
     w("\n## Handler shapes\n")
     by_ann = Counter(h["annotation"] for h in rep.handlers)
     w(", ".join(f"`@{k}`: {c}" for k, c in by_ann.most_common()) or "_none_")
     w("")
-    w("| shape | thin | count | examples |")
-    w("|---|---|---:|---|")
+    w("| shape | thin | migration | count | examples |")
+    w("|---|---|---|---:|---|")
     for shape, status, count, v in handler_findings(rep):
-        w(f"| {shape} | {status} | {count} | {ex(v)} |")
+        w(f"| {shape} | {status} | {shape_migration(shape, status)} | {count} | {ex(v)} |")
     returns = Counter(h["returns"] or "?" for h in rep.handlers
                       if h["annotation"] == "CommandHandler" and h["kind"] == "method")
     if returns:
         w("\nCommand handler return types: " + ", ".join(f"`{k}`: {c}" for k, c in returns.most_common()))
 
     w("\n## Calls on Axon types\n")
-    w("| call | count | examples |")
-    w("|---|---:|---|")
+    w("| call | count | migration | examples |")
+    w("|---|---:|---|---|")
     for k, v in sorted(rep.member_calls.items(), key=lambda kv: -len(kv[1])):
-        w(f"| `{k}` | {len(v)} | {ex(v)} |")
+        w(f"| `{k}` | {len(v)} | {call_migration(rep, k)} | {ex(v)} |")
 
     if rep.supertypes:
         w("\n## Classes implementing / extending Axon types\n")
@@ -821,7 +1024,7 @@ def to_markdown(rep: Report, examples: int) -> str:
     if rep.bean_overrides:
         w("\n## `@Bean`s providing Axon infrastructure (engine customization)\n")
         for k, v in sorted(rep.bean_overrides.items(), key=lambda kv: -len(kv[1])):
-            w(f"- `{k}` × {len(v)}: {ex(v)}")
+            w(f"- `{k}` × {len(v)} — **{bean_migration(rep, k)}**: {ex(v)}")
     if rep.orm_overrides:
         w("\n## JPA mapping overrides of Axon entities (orm.xml)\n")
         w("Drives axon-thin's `axon.thin.event-store.*` settings: table prefix/names, global-index generator, "
@@ -838,7 +1041,8 @@ def to_markdown(rep: Report, examples: int) -> str:
     if rep.dependencies:
         w("\n## Axon dependencies\n")
         for k, v in sorted(rep.dependencies.items()):
-            w(f"- `{k}`: {', '.join(sorted(v))}")
+            hint = "" if k.startswith("(") else f" — **{dependency_migration(k)}**"
+            w(f"- `{k}`{hint}: {', '.join(sorted(v))}")
     if rep.unclassified:
         w("\n## Unclassified Axon types (add to CATALOG)\n")
         for k, v in sorted(rep.unclassified.items(), key=lambda kv: -len(kv[1])):
