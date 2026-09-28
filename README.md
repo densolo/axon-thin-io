@@ -287,7 +287,14 @@ For code that talks to the event store itself:
       }
   }
   browser.decode(browser.event(id)!!).payloadAs<TaskCreatedEvent>()             // typed, or null for anything else
+
+  // like eventStore.readEvents(id).asSequence(): lazy, page by page — but every event from 0, no snapshot, no failures
+  browser.readEvents(taskId).map { it.metaData["correlationId"] to it.payloadAs<TaskRenamedEvent>() }
   ```
+
+  Existing `eventStore.readEvents(id).asSequence().map { … }` code keeps working unchanged on both engines.
+  `DomainEventStream` is an `Iterator`, and thin's `EventStore` bean keeps Axon's semantics, including the snapshot as
+  the first element.
 
   Configure the table with `axon.thin.event-store.table-prefix` / `domain-event-table` on both engines. The v4
   adapter reads the same keys, so the configuration doesn't change at the switch.

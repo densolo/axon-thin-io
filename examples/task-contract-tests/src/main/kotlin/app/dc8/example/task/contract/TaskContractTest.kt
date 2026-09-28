@@ -22,6 +22,7 @@ import app.dc8.example.task.api.TaskStatusChangedEvent
 import app.dc8.example.task.api.TaskCreatedEvent
 import app.dc8.example.task.api.TaskStatus
 import app.dc8.example.task.api.TasksImportedEvent
+import app.dc8.example.task.domain.Task
 import app.dc8.example.task.projection.CommentViewRepository
 import app.dc8.example.task.projection.TaskActivityRepository
 import app.dc8.example.task.projection.TaskSummaryRepository
@@ -494,6 +495,21 @@ abstract class TaskContractTest {
         assertThat(browser.decode(browser.event(created.eventIdentifier)!!).payloadAs<TaskCreatedEvent>()?.title).isEqualTo("detail")
         assertThat(browser.decode(created).payloadAs<TaskRenamedEvent>()).isNull() // another type
         assertThat(browser.event("no-such-id")).isNull()
+    }
+
+    @Test
+    fun `browser readEvents is a lazy decoded sequence, like eventStore readEvents asSequence`() {
+        val id = taskWithRenames(11) // 12 events: past the snapshot threshold, so readEvents on the EventStore starts with it
+
+        val titles = browser.readEvents(id, pageSize = 5)
+            .map { (it.payloadAs<TaskCreatedEvent>()?.title ?: it.payloadAs<TaskRenamedEvent>()?.title) to it.metaData.keys }
+            .toList()
+
+        assertThat(titles.map { it.first }).isEqualTo((0..11).map { "r$it" }) // every event, no snapshot
+        assertThat(titles).allSatisfy { assertThat(it.second).contains("correlationId", "traceId") }
+        assertThat(browser.readEvents(id, fromSequence = 10).map { it.row.sequenceNumber }.toList()).containsExactly(10L, 11L)
+        // the EventStore variant keeps Axon's semantics: the latest snapshot first
+        assertThat(eventStore.readEvents(id).asSequence().first().payload).isInstanceOf(Task::class.java)
     }
 
     @Test

@@ -60,6 +60,22 @@ class EventStoreBrowser(
         return ids.mapNotNull(found::get)
     }
 
+    /**
+     * One aggregate's events, decoded, as a lazy sequence fetching [pageSize] rows at a time as it is consumed —
+     * the browser's counterpart of `eventStore.readEvents(id).asSequence()`:
+     * `browser.readEvents(id).map { it.metaData to it.payloadAs<MyEvent>() }`.
+     *
+     * Unlike `EventStore.readEvents`, it never starts with a snapshot (every event from [fromSequence], inclusive) and
+     * never fails on an event it cannot decode ([Payload.Unknown] / [Payload.Failed] instead).
+     */
+    fun readEvents(aggregateIdentifier: String, fromSequence: Long = 0, pageSize: Int = 100): Sequence<DecodedEvent> {
+        val decoder = requireDecoder()
+        return generateSequence(aggregate(aggregateIdentifier, fromSequence - 1, pageSize)) { page ->
+            if (page.size < pageSize) null
+            else aggregate(aggregateIdentifier, page.last().sequenceNumber, pageSize).takeIf { it.isNotEmpty() }
+        }.flatten().map { DecodedEvent(it, decoder) }
+    }
+
     /** Metadata now, payload on first access — never throws for a bad row (see [Payload]). */
     fun decode(row: Row): DecodedEvent = DecodedEvent(row, requireDecoder())
 
