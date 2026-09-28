@@ -2,7 +2,8 @@ package app.dc8.axonthin
 
 import app.dc8.axonthin.aggregate.ThinSnapshotter
 import app.dc8.axonthin.api.ChunkContext
-import app.dc8.axonthin.eventstore.EventStoreBrowser
+import app.dc8.axonthin.api.EventStoreBrowser
+import app.dc8.axonthin.eventstore.SerializerEventDecoder
 import app.dc8.axonthin.eventstore.GlobalIndexAllocator
 import app.dc8.axonthin.eventstore.ThinAxonEventStore
 import app.dc8.axonthin.eventstore.PooledSequenceAllocator
@@ -120,8 +121,12 @@ class ThinAxonAutoConfiguration {
     @ConditionalOnBean(DataSource::class)
     @ConditionalOnProperty(prefix = "axon.thin.event-store", name = ["enabled"], matchIfMissing = true)
     @ConditionalOnMissingBean
-    fun eventStoreBrowser(dataSource: DataSource, properties: ThinAxonProperties): EventStoreBrowser =
-        EventStoreBrowser(JdbcTemplate(dataSource), properties.eventStore.domainEventTableName)
+    fun eventStoreBrowser(
+        dataSource: DataSource,
+        properties: ThinAxonProperties,
+        @Qualifier("eventSerializer") serializer: Serializer,
+    ): EventStoreBrowser =
+        EventStoreBrowser(dataSource, properties.eventStore.domainEventTableName, SerializerEventDecoder(serializer))
 
     /** Axon's EventStore interface for application code that reads streams or publishes domain events directly. */
     @Bean

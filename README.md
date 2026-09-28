@@ -18,9 +18,10 @@ repositories.
 ## Modules
 
 ```
-axon-thin-api            the only non-Axon API, dependency-free: BulkCommandGateway + BulkOptions, ChunkContext, @ReplayInto
+axon-thin-api            the only non-Axon API, dependency-free: BulkCommandGateway + BulkOptions, ChunkContext, @ReplayInto,
+                         EventStoreBrowser
 axon-thin                the thin runtime + Spring Boot auto-configuration (uses Axon jars for their types only)
-axon-thin-v4-adapter     the same API on real Axon 4: sendAllAndWait (+ retry) and ChunkContext
+axon-thin-v4-adapter     the same API on real Axon 4: sendAllAndWait (+ retry), ChunkContext, EventStoreBrowser
 
 examples/task-model           Task aggregate (event-sourced, comments inside), an external command handler,
                               JPA read models + projections, query service (Axon types are `provided`)
@@ -261,12 +262,35 @@ For code that talks to the event store itself:
     it like any other event.
   - `lastSequenceNumberFor` and `storeSnapshot` work as in Axon.
   - The tracking methods (`openStream`, tokens) and `subscribe` throw `UnsupportedOperationException`.
-- **`EventStoreBrowser`** is for debug and admin pages. It returns raw rows, with payload and metadata as JSON text
-  and nothing deserialized, so it also lists event types the code no longer knows. It pages by keyset:
+- **`EventStoreBrowser`** (in `axon-thin-api`, provided as a bean by **both** `axon-thin` and `axon-thin-v4-adapter`,
+  so debug pages built on it survive the engine switch) reads the event table directly:
+  - **Rows are raw:** payload and metadata as text (your serializer's JSON), nothing deserialized, so it also lists
+    event types the running code no longer knows.
+  - **Paging is by keyset;** reads by id return rows in the requested order.
+  - **`decode(...)`** uses the engine's event serializer. Metadata is decoded right away (plain values, never fails
+    on a missing class). The payload is decoded only when first accessed, and the outcome is `Payload.Decoded(value)`,
+    `Payload.Unknown(type)` (class not on the classpath) or `Payload.Failed(error)` (unreadable). One bad row never
+    breaks a list.
+
   ```kotlin
-  browser.aggregate(id, afterSequence = lastSeenSequence, limit = 50)          // one stream, page by page
-  browser.latest(limit = 50, beforeGlobalIndex = lastSeenIndex, filter = EventStoreBrowser.Filter(aggregateType = "Task"))
+  // list: metadata only, payloads never deserialized
+  val rows = browser.latest(limit = 50, beforeGlobalIndex = lastSeenIndex, filter = EventStoreBrowser.Filter(aggregateType = "Task"))
+  val list = browser.decode(rows).map { it.row.eventIdentifier to it.metaData["correlationId"] }
+  browser.aggregate(taskId, afterSequence = lastSeenSequence, limit = 50)       // one stream, page by page
+
+  // details: fetch the clicked events by id, then read the payloads
+  for (event in browser.decode(browser.events(listOf(id1, id2)))) {
+      when (val p = event.payload) {
+          is Payload.Decoded -> render(p.value)             // e.g. `when (p.value) { is TaskCreatedEvent -> … }`
+          is Payload.Unknown -> renderRaw(event.row.payload)
+          is Payload.Failed  -> renderRaw(event.row.payload, p.error)
+      }
+  }
+  browser.decode(browser.event(id)!!).payloadAs<TaskCreatedEvent>()             // typed, or null for anything else
   ```
+
+  Configure the table with `axon.thin.event-store.table-prefix` / `domain-event-table` on both engines. The v4
+  adapter reads the same keys, so the configuration doesn't change at the switch.
 
 **The pre-thin bulk pattern keeps working unchanged**, verified on both engines (`TaskBulkRenameService`):
 - rename commands flagged `bulk = true`, recorded on the events so the aggregates stay correct;

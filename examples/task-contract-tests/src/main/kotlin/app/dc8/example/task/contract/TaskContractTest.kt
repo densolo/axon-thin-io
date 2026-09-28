@@ -1,6 +1,8 @@
 package app.dc8.example.task.contract
 
 import app.dc8.axonthin.api.BulkCommandGateway
+import app.dc8.axonthin.api.EventStoreBrowser
+import app.dc8.axonthin.api.Payload
 import app.dc8.example.task.TaskBulkRenameService
 import app.dc8.example.task.TaskService
 import app.dc8.example.task.api.AddCommentCommand
@@ -16,6 +18,8 @@ import app.dc8.example.task.api.ImportTaskCommand
 import app.dc8.example.task.api.RenameTaskCommand
 import app.dc8.example.task.api.TaskClosedException
 import app.dc8.example.task.api.TaskRenamedEvent
+import app.dc8.example.task.api.TaskStatusChangedEvent
+import app.dc8.example.task.api.TaskCreatedEvent
 import app.dc8.example.task.api.TaskStatus
 import app.dc8.example.task.api.TasksImportedEvent
 import app.dc8.example.task.projection.CommentViewRepository
@@ -71,6 +75,7 @@ abstract class TaskContractTest {
     @Autowired lateinit var chunkPositions: ChunkPositionRecorder
     @Autowired lateinit var eventStore: EventStore
     @Autowired lateinit var bulkRename: TaskBulkRenameService
+    @Autowired lateinit var browser: EventStoreBrowser
 
     protected open val eventTable = "axon_domain_event_entry"
     protected val stored by lazy { StoredEvents(jdbc, eventTable) }
@@ -421,6 +426,88 @@ abstract class TaskContractTest {
             eventStore.publish(GenericDomainEventMessage("Task", taskId, 0, TaskRenamedEvent(taskId, "dup")))
         }.isInstanceOf(AggregateStreamCreationException::class.java)
         assertThat(stored.forAggregate(taskId)).hasSize(1)
+    }
+
+    // ---- EventStoreBrowser (debug pages): raw rows, paging, reads by id, decoding --------------------------------------
+
+    private fun taskWithRenames(renames: Int): String = createTask("r0").also { id ->
+        (1..renames).forEach { commandGateway.sendAndWait<Any>(RenameTaskCommand(id, "r$it")) }
+    }
+
+    private fun insertRaw(payloadType: String, payload: String, aggregateId: String = id()): String = id().also { eventId ->
+        jdbc.update(
+            "insert into $eventTable (global_index, event_identifier, payload_type, payload_revision, payload, meta_data, " +
+                "time_stamp, aggregate_identifier, sequence_number, type) values (?,?,?,?,?,?,?,?,?,?)",
+            999_990_000L + stored.count(), eventId, payloadType, null, payload.toByteArray(), "{\"source\":\"raw\"}".toByteArray(),
+            "2026-01-01T00:00:00.000Z", aggregateId, 0, "Other",
+        )
+    }
+
+    @Test
+    fun `browser pages through one aggregate's stream`() {
+        val id = taskWithRenames(11) // 12 events
+
+        val pages = generateSequence(browser.aggregate(id, limit = 5)) { page ->
+            if (page.size < 5) null else browser.aggregate(id, afterSequence = page.last().sequenceNumber, limit = 5)
+        }.toList()
+
+        assertThat(pages.map { it.size }).containsExactly(5, 5, 2)
+        assertThat(pages.flatten().map { it.sequenceNumber }).isEqualTo((0L..11L).toList())
+        assertThat(pages.first().first().payload).contains("\"title\":\"r0\"") // raw JSON text
+        assertThat(browser.count(id)).isEqualTo(12)
+    }
+
+    @Test
+    fun `browser lists the table newest first, with filters, including unknown event types`() {
+        val a = taskWithRenames(2)
+        val b = taskWithRenames(1)
+        insertRaw("com.example.gone.OldEvent", "{\"x\":1}")
+
+        val first = browser.latest(limit = 3)
+        val second = browser.latest(limit = 3, beforeGlobalIndex = first.last().globalIndex)
+
+        assertThat(first.first().payloadType).isEqualTo("com.example.gone.OldEvent")
+        assertThat((first + second).map { it.globalIndex }).isSortedAccordingTo(Comparator.reverseOrder()).hasSize(6)
+        assertThat(browser.latest(filter = EventStoreBrowser.Filter(aggregateIdentifier = a)).map { it.sequenceNumber })
+            .containsExactly(2L, 1L, 0L)
+        assertThat(browser.latest(filter = EventStoreBrowser.Filter(payloadType = TaskRenamedEvent::class.java.name)))
+            .hasSize(3).allSatisfy { assertThat(it.aggregateIdentifier).isIn(a, b) }
+    }
+
+    @Test
+    fun `browser reads events by id in the requested order and decodes them`() {
+        val taskId = id()
+        val create = GenericCommandMessage.asCommandMessage<CreateTaskCommand>(CreateTaskCommand(taskId, "detail"))
+        commandGateway.sendAndWait<String>(create)
+        commandGateway.sendAndWait<Any>(ChangeTaskStatusCommand(taskId, TaskStatus.IN_PROGRESS))
+        val (created, changed) = browser.aggregate(taskId)
+
+        val rows = browser.events(listOf(changed.eventIdentifier, "no-such-id", created.eventIdentifier))
+        val decoded = browser.decode(rows)
+
+        assertThat(rows.map { it.eventIdentifier }).containsExactly(changed.eventIdentifier, created.eventIdentifier)
+        assertThat(decoded.map { it.metaData["correlationId"] }).allSatisfy { assertThat(it).isNotNull() }
+        assertThat(decoded[1].metaData["correlationId"]).isEqualTo(create.identifier)
+        val payloads = decoded.map { (it.payload as Payload.Decoded).value }
+        assertThat(payloads[0]).isEqualTo(TaskStatusChangedEvent(taskId, TaskStatus.TODO, TaskStatus.IN_PROGRESS)) // via the app's serializer
+        assertThat(payloads[1]).isEqualTo(TaskCreatedEvent(taskId, "detail", null, null))
+        assertThat(browser.decode(browser.event(created.eventIdentifier)!!).payloadAs<TaskCreatedEvent>()?.title).isEqualTo("detail")
+        assertThat(browser.decode(created).payloadAs<TaskRenamedEvent>()).isNull() // another type
+        assertThat(browser.event("no-such-id")).isNull()
+    }
+
+    @Test
+    fun `decoding never fails a list - unknown classes and unreadable payloads are reported per row`() {
+        val unknown = insertRaw("com.example.gone.OldEvent", "{\"x\":1}")
+        val broken = insertRaw(TaskCreatedEvent::class.java.name, "{not json")
+
+        val (u, b) = browser.decode(browser.events(listOf(unknown, broken)))
+
+        assertThat(u.metaData).containsEntry("source", "raw") // metadata is always readable
+        assertThat(b.metaData).containsEntry("source", "raw")
+        assertThat(u.payload).isEqualTo(Payload.Unknown("com.example.gone.OldEvent", null))
+        assertThat(b.payload).isInstanceOf(Payload.Failed::class.java)
+        assertThat(b.payloadAs<TaskCreatedEvent>()).isNull()
     }
 
     // ---- storage format (what the other engine / other services will read) -----------------------------------------

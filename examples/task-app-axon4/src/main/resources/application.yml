@@ -13,3 +13,6 @@ axon:
     general: jackson
     events: jackson
     messages: jackson
+  thin:
+    event-store:
+      table-prefix: axon_   # EventStoreBrowser (v4 adapter): the tables axon-orm.xml maps
