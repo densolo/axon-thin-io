@@ -64,6 +64,15 @@ scripts/axon-usage-scan  inventory of Axon usage in a real project (see its READ
 ### Chunks: set-based `sendAllAndWait` (thin only)
 
 Every top-level dispatch is a *chunk*: `sendAndWait` is a chunk of one, `sendAllAndWait(commands)` a chunk of N.
+
+`sendAllAndWait` returns `List<R>`, typed like Axon's `<R> R sendAndWait(command)`: an unchecked cast, with `R` taken
+from the expected type or given explicitly.
+```kotlin
+val ids: List<String> = bulk.sendAllAndWait(creates)                     // R from the expected type
+val previous = bulk.sendAllAndWait<TaskStatus>(statusChanges)             // explicit
+bulk.sendAllAndWait<Any?>(listOf(create, rename, assign))                 // mixed results, or results not needed
+```
+A wrong `R` fails where an element is used (`ClassCastException`), not in the gateway.
 A chunk runs in one transaction:
 
 | Stage | Round trips |

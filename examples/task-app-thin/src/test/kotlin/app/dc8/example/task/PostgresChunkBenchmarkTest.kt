@@ -45,7 +45,7 @@ class PostgresChunkBenchmarkTest {
 
     private fun measure(scenario: String, chunks: List<List<Any>>): Row {
         recorder.clear()
-        val ms = measureTimeMillis { chunks.forEach { bulk.sendAllAndWait(it) } }
+        val ms = measureTimeMillis { chunks.forEach { bulk.sendAllAndWait<Any?>(it) } }
         val es = recorder.count(eventStore)
         val perEvent = recorder.count(perEventProjection)
         val batch = recorder.count(batchProjection)
@@ -57,8 +57,8 @@ class PostgresChunkBenchmarkTest {
         fun creates(n: Int) = List(n) { CreateTaskCommand(UUID.randomUUID().toString(), "task $it") }
         measure("warm-up", listOf(creates(200), creates(200))) // JIT, connection pool, sequence blocks
 
-        val ids100 = bulk.sendAllAndWait(creates(100)).map { it as String }
-        val ids1k = bulk.sendAllAndWait(creates(1_000)).map { it as String }
+        val ids100 = bulk.sendAllAndWait<String>(creates(100))
+        val ids1k = bulk.sendAllAndWait<String>(creates(1_000))
         val rows = listOf(
             measure("create 100, one chunk", listOf(creates(100))),
             measure("create 1k, one chunk", listOf(creates(1_000))),

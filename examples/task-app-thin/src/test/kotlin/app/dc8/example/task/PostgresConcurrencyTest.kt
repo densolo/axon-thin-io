@@ -67,7 +67,7 @@ class PostgresConcurrencyTest {
         val jdbc = backend.getBean(JdbcTemplate::class.java)
         val stored = StoredEvents(jdbc, "axon_domain_event_entry")
         val taskIds = List(50) { UUID.randomUUID().toString() }
-        backend.getBean(BulkCommandGateway::class.java).sendAllAndWait(taskIds.map { CreateTaskCommand(it, "created") })
+        backend.getBean(BulkCommandGateway::class.java).sendAllAndWait<Any?>(taskIds.map { CreateTaskCommand(it, "created") })
 
         val errors = Collections.synchronizedList(ArrayList<Throwable>())
         val start = CountDownLatch(1)
@@ -81,7 +81,7 @@ class PostgresConcurrencyTest {
                 start.await()
                 val bulk = jobs.getBean(BulkCommandGateway::class.java)
                 repeat(jobRounds) { round ->
-                    bulk.sendAllAndWait(taskIds.map { RenameTaskCommand(it, "job-$round") }, BulkOptions(concurrencyRetries = 20))
+                    bulk.sendAllAndWait<Any?>(taskIds.map { RenameTaskCommand(it, "job-$round") }, BulkOptions(concurrencyRetries = 20))
                 }
             }.onFailure(errors::add)
         }

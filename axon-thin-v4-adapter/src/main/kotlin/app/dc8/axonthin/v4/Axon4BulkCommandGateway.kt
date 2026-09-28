@@ -23,12 +23,14 @@ class Axon4BulkCommandGateway(
 
     private val transaction = TransactionTemplate(transactionManager)
 
-    override fun sendAllAndWait(commands: List<Any>, options: BulkOptions): List<Any?> {
+    /** Results cast to `List<R>` unchecked, like `sendAndWait`'s `R`. */
+    @Suppress("UNCHECKED_CAST")
+    override fun <R> sendAllAndWait(commands: List<Any>, options: BulkOptions): List<R> {
         val ownsTransaction = !TransactionSynchronizationManager.isActualTransactionActive()
         var attempt = 0
         while (true) {
             try {
-                return transaction.execute { runChunk(commands) }!!
+                return transaction.execute { runChunk(commands) }!! as List<R>
             } catch (e: ConcurrencyException) {
                 if (!ownsTransaction || attempt >= options.concurrencyRetries) throw e
                 attempt++

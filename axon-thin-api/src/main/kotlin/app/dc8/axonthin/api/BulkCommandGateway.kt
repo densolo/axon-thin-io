@@ -15,13 +15,18 @@ package app.dc8.axonthin.api
  *
  * Elements may be plain payloads or pre-built Axon `CommandMessage`s (e.g. to carry metadata).
  *
+ * [R] works like Axon's `<R> R sendAndWait(command)`: an unchecked cast of the handler results, taken from the expected
+ * type or given explicitly — `val ids: List<String> = sendAllAndWait(creates)` or `sendAllAndWait<String>(creates)`.
+ * A mismatch surfaces as ClassCastException where an element is used; for chunks mixing commands with different
+ * results use `sendAllAndWait<Any?>(…)`.
+ *
  * @return the handler results, in the same order as [commands] (`null` for `Unit`/`void` handlers)
  */
 interface BulkCommandGateway {
 
-    fun sendAllAndWait(commands: List<Any>): List<Any?> = sendAllAndWait(commands, BulkOptions.DEFAULT)
+    fun <R> sendAllAndWait(commands: List<Any>): List<R> = sendAllAndWait(commands, BulkOptions.DEFAULT)
 
-    fun sendAllAndWait(commands: List<Any>, options: BulkOptions): List<Any?>
+    fun <R> sendAllAndWait(commands: List<Any>, options: BulkOptions): List<R>
 }
 
 data class BulkOptions(

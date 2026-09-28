@@ -21,16 +21,16 @@ class TaskService(
 
     /** Bulk import: all tasks or none. */
     fun importTasks(titles: List<String>): List<String> =
-        bulk.sendAllAndWait(titles.map { CreateTaskCommand(UUID.randomUUID().toString(), it) }).map { it as String }
+        bulk.sendAllAndWait(titles.map { CreateTaskCommand(UUID.randomUUID().toString(), it) })
 
     /** Bulk upsert (CREATE_IF_MISSING): creates missing tasks, renames existing ones. */
     fun upsertTasks(titlesById: Map<String, String>): List<String> =
-        bulk.sendAllAndWait(titlesById.map { (id, title) -> ImportTaskCommand(id, title) }).map { it as String }
+        bulk.sendAllAndWait(titlesById.map { (id, title) -> ImportTaskCommand(id, title) })
 
     /** Joins the caller's transaction: sendAllAndWait participates instead of opening its own. */
     @Transactional
     fun closeAll(taskIds: List<String>): Map<String, TaskStatus> {
-        val previous = bulk.sendAllAndWait(taskIds.map { ChangeTaskStatusCommand(it, TaskStatus.DONE) })
-        return taskIds.zip(previous.map { it as TaskStatus }).toMap()
+        val previous = bulk.sendAllAndWait<TaskStatus>(taskIds.map { ChangeTaskStatusCommand(it, TaskStatus.DONE) })
+        return taskIds.zip(previous).toMap()
     }
 }

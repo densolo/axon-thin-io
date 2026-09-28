@@ -323,7 +323,7 @@ abstract class TaskContractTest {
     fun `bulk commands on one aggregate leave a usable snapshot`() {
         val taskId = id()
 
-        bulk.sendAllAndWait(listOf(CreateTaskCommand(taskId, "b0")) + (1..11).map { RenameTaskCommand(taskId, "b$it") })
+        bulk.sendAllAndWait<Any?>(listOf(CreateTaskCommand(taskId, "b0")) + (1..11).map { RenameTaskCommand(taskId, "b$it") })
 
         assertThat(stored.snapshots(taskId)).hasSize(1)
         stored.deleteEventsUpTo(taskId, stored.snapshots(taskId).single().sequenceNumber)
@@ -338,7 +338,7 @@ abstract class TaskContractTest {
         val title = "unique-${id()}"
 
         assertThatThrownBy {
-            bulk.sendAllAndWait(listOf(CreateTaskCommand(id(), title), ReserveTitleCommand(title)))
+            bulk.sendAllAndWait<Any?>(listOf(CreateTaskCommand(id(), title), ReserveTitleCommand(title)))
         }.isInstanceOf(TitleTakenException::class.java)
         assertThat(stored.count()).isZero()
     }
@@ -348,16 +348,16 @@ abstract class TaskContractTest {
         val title = "unique-${id()}"
         createTask(title)
 
-        assertThatThrownBy { bulk.sendAllAndWait(listOf(ReserveTitleCommand(title))) }
+        assertThatThrownBy { bulk.sendAllAndWait<Any?>(listOf(ReserveTitleCommand(title))) }
             .isInstanceOf(TitleTakenException::class.java)
-        bulk.sendAllAndWait(listOf(ReserveTitleCommand("free-${id()}"), CreateTaskCommand(id(), "other-${id()}")))
+        bulk.sendAllAndWait<Any?>(listOf(ReserveTitleCommand("free-${id()}"), CreateTaskCommand(id(), "other-${id()}")))
     }
 
     @Test
     fun `chunk context reports the chunk's commands and the current position`() {
         chunkPositions.seen.clear()
 
-        bulk.sendAllAndWait(
+        bulk.sendAllAndWait<Any?>(
             listOf(CreateTaskCommand(id(), "x"), RecordChunkPositionCommand("bulk"), CreateTaskCommand(id(), "y")),
         )
         commandGateway.sendAndWait<Any>(RecordChunkPositionCommand("single"))
@@ -535,7 +535,7 @@ abstract class TaskContractTest {
     fun `sendAllAndWait returns results in command order`() {
         val ids = List(50) { id() }
 
-        val results = bulk.sendAllAndWait(ids.mapIndexed { i, taskId -> CreateTaskCommand(taskId, "Task $i") })
+        val results = bulk.sendAllAndWait<String>(ids.mapIndexed { i, taskId -> CreateTaskCommand(taskId, "Task $i") })
 
         assertThat(results).containsExactlyElementsOf(ids)
         assertThat(queries.countTasks()).isEqualTo(50)
@@ -543,9 +543,19 @@ abstract class TaskContractTest {
     }
 
     @Test
+    fun `sendAllAndWait results are typed like sendAndWait - an unchecked cast`() {
+        val ids: List<String> = bulk.sendAllAndWait(listOf(CreateTaskCommand(id(), "a"), CreateTaskCommand(id(), "b")))
+        assertThat(ids).allSatisfy { assertThat(it).hasSize(36) } // the created task ids
+
+        // a wrong R is not detected by the gateway, only where an element is used — as with sendAndWait<R>
+        val wrong: List<Int> = bulk.sendAllAndWait(listOf(CreateTaskCommand(id(), "c")))
+        assertThatThrownBy { wrong.first() + 1 }.isInstanceOf(ClassCastException::class.java)
+    }
+
+    @Test
     fun `sendAllAndWait is all-or-nothing`() {
         assertThatThrownBy {
-            bulk.sendAllAndWait(
+            bulk.sendAllAndWait<Any?>(
                 listOf(CreateTaskCommand(id(), "one"), CreateTaskCommand(id(), "two"), CreateTaskCommand(id(), " ")),
             )
         }.isExactlyInstanceOf(IllegalArgumentException::class.java)
@@ -560,7 +570,7 @@ abstract class TaskContractTest {
         val taskId = id()
 
         assertThatThrownBy {
-            bulk.sendAllAndWait(listOf(CreateTaskCommand(taskId, "one"), CreateTaskCommand(taskId, "dup")))
+            bulk.sendAllAndWait<Any?>(listOf(CreateTaskCommand(taskId, "one"), CreateTaskCommand(taskId, "dup")))
         }.isInstanceOf(AggregateStreamCreationException::class.java)
 
         assertThat(stored.count()).isZero()
@@ -571,7 +581,7 @@ abstract class TaskContractTest {
     fun `sendAllAndWait lets later commands see earlier effects on the same aggregate`() {
         val taskId = id()
 
-        val results = bulk.sendAllAndWait(
+        val results = bulk.sendAllAndWait<Any?>(
             listOf(
                 CreateTaskCommand(taskId, "Bulk"),
                 AddCommentCommand(taskId, "c1", "dan", "first!"),
@@ -593,7 +603,7 @@ abstract class TaskContractTest {
     fun `sendAllAndWait accepts command messages with metadata`() {
         val taskId = id()
 
-        bulk.sendAllAndWait(
+        bulk.sendAllAndWait<Any?>(
             listOf(GenericCommandMessage.asCommandMessage<Any>(CreateTaskCommand(taskId, "m")).andMetaData(mapOf("userId" to "eve"))),
         )
 

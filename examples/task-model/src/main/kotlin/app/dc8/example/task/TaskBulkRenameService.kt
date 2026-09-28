@@ -22,7 +22,7 @@ class TaskBulkRenameService(
 ) {
     @Transactional
     fun renameAll(titlesById: Map<String, String>) {
-        bulk.sendAllAndWait(titlesById.map { (id, title) -> RenameTaskCommand(id, title, bulk = true) })
+        bulk.sendAllAndWait<Any?>(titlesById.map { (id, title) -> RenameTaskCommand(id, title, bulk = true) })
         eventStore.publish(
             GenericDomainEventMessage(
                 BULK_TYPE, "$BULK_TYPE-${UUID.randomUUID()}", 0,

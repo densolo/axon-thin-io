@@ -69,7 +69,7 @@ class ThinBatchProjectionTest {
         val a = id()
         val b = id()
         val c = id()
-        bulk.sendAllAndWait(
+        bulk.sendAllAndWait<Any?>(
             listOf(
                 CreateTaskCommand(a, "a"), RenameTaskCommand(a, "a2"), RenameTaskCommand(a, "a3"),
                 CreateTaskCommand(b, "b"), CreateTaskCommand(c, "c"), DeleteTaskCommand(c),
@@ -85,11 +85,11 @@ class ThinBatchProjectionTest {
     @Test
     fun `a 1k chunk costs the batch projection one read and a few write batches`() {
         recorder.clear()
-        val ids = bulk.sendAllAndWait(List(1_000) { CreateTaskCommand(id(), "t$it") }).map { it as String }
+        val ids = bulk.sendAllAndWait<String>(List(1_000) { CreateTaskCommand(id(), "t$it") })
         val createTrips = trips()
         recorder.clear()
 
-        bulk.sendAllAndWait(ids.map { RenameTaskCommand(it, "renamed") })
+        bulk.sendAllAndWait<Any?>(ids.map { RenameTaskCommand(it, "renamed") })
         val renameTrips = trips()
 
         println("round trips for 1k commands, per table: creates $createTrips, renames $renameTrips")
@@ -103,7 +103,7 @@ class ThinBatchProjectionTest {
 
     @Test
     fun `migrator rebuilds the batch projection page by page`() {
-        bulk.sendAllAndWait(List(600) { CreateTaskCommand(id(), "t$it") })
+        bulk.sendAllAndWait<Any?>(List(600) { CreateTaskCommand(id(), "t$it") })
         val live = indexTitles()
         titles.deleteAllInBatch()
         projection.batches.clear()

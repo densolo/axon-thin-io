@@ -73,8 +73,10 @@ class ThinCommandGateway internal constructor(
             CompletableFuture.failedFuture(e)
         }
 
-    override fun sendAllAndWait(commands: List<Any>, options: BulkOptions): List<Any?> =
-        execute(commands.map(::prepare), options.concurrencyRetries)
+    /** Results cast to `List<R>` unchecked, like `sendAndWait`'s `R`. */
+    @Suppress("UNCHECKED_CAST")
+    override fun <R> sendAllAndWait(commands: List<Any>, options: BulkOptions): List<R> =
+        execute(commands.map(::prepare), options.concurrencyRetries) as List<R>
 
     override fun registerDispatchInterceptor(
         dispatchInterceptor: MessageDispatchInterceptor<in CommandMessage<*>>,

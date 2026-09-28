@@ -85,7 +85,7 @@ class ThinChunkPipelineTest {
     private val sequenceFetches = { sql: String -> sql.contains("axon_domain_event_entry_seq") } // H2 and PostgreSQL syntax
 
     private fun createTasks(count: Int): List<String> =
-        bulk.sendAllAndWait(List(count) { CreateTaskCommand(id(), "t$it") }).map { it as String }
+        bulk.sendAllAndWait<String>(List(count) { CreateTaskCommand(id(), "t$it") })
 
     // ---- set-based I/O ------------------------------------------------------------------------------------------------
 
@@ -94,7 +94,7 @@ class ThinChunkPipelineTest {
         val ids = createTasks(100)
         recorder.clear()
 
-        bulk.sendAllAndWait(ids.map { RenameTaskCommand(it, "renamed $it") })
+        bulk.sendAllAndWait<Any?>(ids.map { RenameTaskCommand(it, "renamed $it") })
 
         assertThat(recorder.count(snapshotReads)).isEqualTo(1)
         assertThat(recorder.count(eventReads)).isEqualTo(1)
@@ -107,14 +107,14 @@ class ThinChunkPipelineTest {
     @Test
     fun `preload combines snapshots with the events after them`() {
         val withSnapshot = createTasks(3)
-        repeat(4) { round -> bulk.sendAllAndWait(withSnapshot.map { RenameTaskCommand(it, "r$round") }) } // seq 4 → snapshot
+        repeat(4) { round -> bulk.sendAllAndWait<Any?>(withSnapshot.map { RenameTaskCommand(it, "r$round") }) } // seq 4 → snapshot
         assertThat(withSnapshot).allSatisfy { assertThat(stored.snapshots(it)).hasSize(1) }
-        bulk.sendAllAndWait(withSnapshot.map { RenameTaskCommand(it, "after snapshot") }) // seq 5, after the snapshot
+        bulk.sendAllAndWait<Any?>(withSnapshot.map { RenameTaskCommand(it, "after snapshot") }) // seq 5, after the snapshot
         val plain = createTasks(3)
         recorder.clear()
 
         // same title → no event only if the state (snapshot + later events) was restored correctly
-        val results = bulk.sendAllAndWait(
+        val results = bulk.sendAllAndWait<Any?>(
             withSnapshot.map { RenameTaskCommand(it, "after snapshot") } + plain.map { RenameTaskCommand(it, "t-new") },
         )
 
@@ -132,7 +132,7 @@ class ThinChunkPipelineTest {
         val a = id()
         val b = id()
 
-        bulk.sendAllAndWait(listOf(CreateTaskCommand(a, "a"), RenameTaskCommand(a, "a2"), CreateTaskCommand(b, "b")))
+        bulk.sendAllAndWait<Any?>(listOf(CreateTaskCommand(a, "a"), RenameTaskCommand(a, "a2"), CreateTaskCommand(b, "b")))
 
         assertThat(batchProjection.calls).hasSize(1)
         assertThat(batchProjection.calls.single().map { it.payload::class.simpleName to it.payload.taskId }).containsExactly(
@@ -146,7 +146,7 @@ class ThinChunkPipelineTest {
     fun `projections reflect a chunk only after its last command`() {
         val taskId = id()
 
-        bulk.sendAllAndWait(listOf(CreateTaskCommand(taskId, "new"), ProbeVisibilityCommand(taskId)))
+        bulk.sendAllAndWait<Any?>(listOf(CreateTaskCommand(taskId, "new"), ProbeVisibilityCommand(taskId)))
 
         assertThat(visibility.seen).containsExactly(false) // inside the chunk: summary not written yet …
         assertThat(visibility.pending).singleElement().isInstanceOf(TaskCreatedEvent::class.java) // … but pending
@@ -161,7 +161,7 @@ class ThinChunkPipelineTest {
         val taskId = createTasks(1).single()
         interference.armFor(taskId, times = 1)
 
-        bulk.sendAllAndWait(
+        bulk.sendAllAndWait<Any?>(
             listOf(RenameTaskCommand(taskId, "mine"), InterfereCommand(taskId)),
             BulkOptions(concurrencyRetries = 2),
         )
@@ -178,7 +178,7 @@ class ThinChunkPipelineTest {
         interference.armFor(taskId, times = 1)
 
         assertThatThrownBy {
-            bulk.sendAllAndWait(listOf(RenameTaskCommand(taskId, "mine"), InterfereCommand(taskId)))
+            bulk.sendAllAndWait<Any?>(listOf(RenameTaskCommand(taskId, "mine"), InterfereCommand(taskId)))
         }.isInstanceOf(ConcurrencyException::class.java)
 
         assertThat(stored.forAggregate(taskId).map { it.payload["title"] }).containsExactly("t0", "foreign")
@@ -191,7 +191,7 @@ class ThinChunkPipelineTest {
 
         assertThatThrownBy {
             TransactionTemplate(transactionManager).executeWithoutResult {
-                bulk.sendAllAndWait(
+                bulk.sendAllAndWait<Any?>(
                     listOf(RenameTaskCommand(taskId, "mine"), InterfereCommand(taskId)),
                     BulkOptions(concurrencyRetries = 3),
                 )

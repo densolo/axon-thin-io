@@ -33,16 +33,16 @@ abstract class EngineBenchmark(private val engine: String) {
     }
 
     private fun createTasks(n: Int): List<String> =
-        bulk.sendAllAndWait(List(n) { CreateTaskCommand(UUID.randomUUID().toString(), "t$it") }).map { it as String }
+        bulk.sendAllAndWait<String>(List(n) { CreateTaskCommand(UUID.randomUUID().toString(), "t$it") })
 
     @Test
     fun `engine benchmark`() {
-        repeat(2) { createTasks(200).also { ids -> bulk.sendAllAndWait(ids.map { RenameTaskCommand(it, "warm") }) } } // warm-up
+        repeat(2) { createTasks(200).also { ids -> bulk.sendAllAndWait<Any?>(ids.map { RenameTaskCommand(it, "warm") }) } } // warm-up
 
         lateinit var ids: List<String>
         val rows = listOf(
             measure("create 1k: commands, one chunk") { ids = createTasks(1_000) },
-            measure("rename 1k: commands, one chunk") { bulk.sendAllAndWait(ids.map { RenameTaskCommand(it, "r1") }) },
+            measure("rename 1k: commands, one chunk") { bulk.sendAllAndWait<Any?>(ids.map { RenameTaskCommand(it, "r1") }) },
             measure("rename 1k: bulk pattern (flagged + bulk event)") { bulkRename.renameAll(ids.associateWith { "r2" }) },
         )
 
