@@ -1,5 +1,6 @@
 package app.dc8.axonthin
 
+import app.dc8.axonthin.api.PayloadStorage
 import app.dc8.axonthin.eventstore.ReplayOrder
 import org.springframework.boot.context.properties.ConfigurationProperties
 
@@ -44,6 +45,16 @@ class ThinAxonProperties {
         var storeNonAggregateEvents: Boolean = true
 
         val globalIndex = GlobalIndex()
+
+        /**
+         * How `payload` / `meta_data` are stored: `auto` (default) detects each column's type on first use —
+         * `bytea`/`blob` → binary, PostgreSQL `oid` → large objects, `text`/`varchar`/`clob` → UTF-8 text.
+         */
+        var payloadColumn: PayloadColumn = PayloadColumn.AUTO
+
+        enum class PayloadColumn(val storage: PayloadStorage?) {
+            AUTO(null), BINARY(PayloadStorage.BINARY), OID(PayloadStorage.OID), TEXT(PayloadStorage.TEXT)
+        }
 
         val domainEventTableName: String get() = tablePrefix + domainEventTable
 

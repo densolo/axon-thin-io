@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Example master changelog: pick ONE conversion and set the table prefix your axon-orm.xml / axon-thin use. -->
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                                       http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <property name="axon_prefix" value="axon_"/>
+
+    <include file="oid-to-bytea.sql" relativeToChangelogFile="true"/>
+    <!-- or: <include file="oid-to-text.sql" relativeToChangelogFile="true"/> -->
+</databaseChangeLog>

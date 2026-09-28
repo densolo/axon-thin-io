@@ -312,6 +312,24 @@ On thin the pattern is **no longer needed**: a batch handler gets the same effec
 either way) without the flag and the extra event. Convert projections at your own pace. Converted projections
 replay correctly in either order.
 
+### Payload column types
+
+Thin reads and writes `payload` / `meta_data` stored in any of three ways. It detects each column's type on first
+use per process (`axon.thin.event-store.payload-column: auto | binary | oid | text`):
+
+| Column type | How thin reads / writes | Notes |
+|---|---|---|
+| `bytea` (`blob` on H2) | bytes | Axon-compatible with the bytea dialect or orm override |
+| `oid` | `lo_get(col)` / `lo_from_bytea(0, ?)` | Hibernate's default for Axon's `@Lob byte[]`; each payload is a separate large object (slower); thin frees replaced snapshots' large objects |
+| `text` (`clob` on H2) | UTF-8 strings | readable JSON in SQL; Axon 4 cannot map it |
+
+This covers aggregates, snapshots, replays, the `EventStore` bean and `EventStoreBrowser`.
+- `PayloadStorageTest` runs the same scenario per storage (`text` on H2 and PostgreSQL, `oid` on PostgreSQL). The `oid`
+  run uses tables Hibernate creates from Axon's own mapping, and Axon's `JpaEventStorageEngine` and thin read each
+  other's large objects.
+- **Converting:** Liquibase changesets for `oid → bytea`, `oid → text`, `bytea ↔ text` are in `docs/liquibase`, with a
+  procedure. `PayloadConversionTest` runs them against real data and restarts the application on the new type.
+
 ### Processing groups
 
 Thin accepts `@ProcessingGroup` and ignores it: every event handler bean receives every event, as one subscribing
@@ -349,7 +367,8 @@ come from.
 **Data and schema**
 - **Unique index on `(aggregate_identifier, sequence_number)`.** It is the only concurrency guard. An orm.xml
   `<table>` override drops Axon's own `@Table` index, so check that your database still has it.
-- **`bytea` payload columns on PostgreSQL** (not `oid`).
+- **Payload columns on PostgreSQL** may be `bytea`, `oid` (large objects) or `text`. Each column's type is detected on
+  first use per process, so restart after converting. See *Payload column types*.
 - **The `global_index` sequence's `INCREMENT BY` equals `allocation-size`** (50 by default, as Hibernate creates
   it).
 - **One serializer configuration in every process:** the same Jackson `ObjectMapper` setup and the same Axon
@@ -447,7 +466,6 @@ What it shows (thin-only table above):
 - **Upcasters** (events must evolve additively).
 - **Other Axon features:** sagas, deadlines, queries (`QueryGateway`, `@QueryHandler`), handler interceptors,
   `UnitOfWork` parameters, custom correlation providers, and tracking processors.
-- **PostgreSQL `oid` payload columns:** thin reads and writes `bytea`.
 - **Async snapshot executor:** snapshots are built synchronously after commit.
 
 **Deliberate differences from Axon 4**
@@ -473,8 +491,8 @@ What it shows (thin-only table above):
 
 1. **Run the scanner** (`scripts/axon-usage-scan`) and check its MISSING and PARTIAL rows against the limitations
    above.
-2. **Database:** check that `bytea` payload columns and the unique index on `(aggregate_identifier, sequence_number)`
-   exist.
+2. **Database:** check that the unique index on `(aggregate_identifier, sequence_number)` exists. Payload columns
+   may stay `oid`; see `docs/liquibase` for converting them to `bytea` or `text`.
 3. **Swap engines in both processes together:** backend and jobs switch in the same release. Do the code migration
    below in both.
 4. **Before switching:** run your suite against thin on PostgreSQL (`-Ppostgres`), not just H2.
@@ -659,8 +677,8 @@ mvn test -Ppostgres -pl examples/task-app-thin -Dtest=PostgresChunkBenchmarkTest
     aggregates at the same time. It checks for contiguous sequences and read models equal to the last event, and
     reports `global_index` order inversions.
   - `PostgresChunkBenchmarkTest`: timings and round trips per chunk.
-- **Axon 4 on PostgreSQL** needs `bytea` payload columns (Hibernate's default for `@Lob byte[]` is `oid`). The tests use
-  `ByteaEnforcedPostgresSQLDialect`, as recommended in Axon's reference guide. Your production mapping must also
-  produce `bytea`.
+- **Axon 4 on PostgreSQL:** the tests use `bytea` payload columns through `ByteaEnforcedPostgresSQLDialect` (from Axon's
+  reference guide), except `OidPayloadStorageTest`, which uses Hibernate's default `oid`.
+- **PostgreSQL-only tests** also include `OidPayloadStorageTest` and `PayloadConversionTest`.
 
 JDK 21+ (bytecode target 21), Kotlin 2.4, Spring Boot 3.5, H2 and PostgreSQL 17.

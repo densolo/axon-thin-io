@@ -1,5 +1,6 @@
 package app.dc8.axonthin.eventstore
 
+import app.dc8.axonthin.api.PayloadStorage
 import org.axonframework.common.DateTimeUtils
 import org.axonframework.eventhandling.DomainEventMessage
 import org.axonframework.eventhandling.EventMessage
@@ -45,23 +46,61 @@ class ThinEventStore internal constructor(
     private val snapshotTable: String,
     private val globalIndex: GlobalIndexAllocator,
     private val storeNonAggregateEvents: Boolean,
+    /** `null` = detect each column's type on first use (`axon.thin.event-store.payload-column: auto`). */
+    private val forcedStorage: PayloadStorage? = null,
 ) {
+    /** Storage of the two serialized columns of one table. */
+    data class StoredColumns(val payload: PayloadStorage, val metaData: PayloadStorage) {
+        companion object {
+            val BINARY = StoredColumns(PayloadStorage.BINARY, PayloadStorage.BINARY)
+        }
+    }
+
     private val log = LoggerFactory.getLogger(ThinEventStore::class.java)
+
+    /**
+     * How `payload` / `meta_data` are stored in the event table (bytea, oid or text). Detected on first use rather
+     * than at bean creation, so tables Hibernate creates during startup are seen; once per process, so converted
+     * columns are picked up by a restart.
+     */
+    val eventColumns: StoredColumns by lazy { storedColumns(table) }
+
+    /** The same for the snapshot table. */
+    val snapshotColumns: StoredColumns by lazy { storedColumns(snapshotTable) }
+
+    private fun storedColumns(of: String): StoredColumns =
+        (forcedStorage?.let { StoredColumns(it, it) } ?: StoredColumns(
+            PayloadStorage.detect(jdbc.dataSource!!, of, "payload"),
+            PayloadStorage.detect(jdbc.dataSource!!, of, "meta_data"),
+        )).also { log.info("Table {}: payload stored as {}, meta_data as {}", of, it.payload, it.metaData) }
 
     private val metaDataType = SimpleSerializedType(MetaData::class.java.name, null)
 
-    private val withIndexSql = "insert into $table (global_index, event_identifier, payload_type, payload_revision, " +
-        "payload, meta_data, time_stamp, aggregate_identifier, sequence_number, type) values (?,?,?,?,?,?,?,?,?,?)"
-    private val identitySql = "insert into $table (event_identifier, payload_type, payload_revision, " +
-        "payload, meta_data, time_stamp, aggregate_identifier, sequence_number, type) values (?,?,?,?,?,?,?,?,?)"
-    private val columns = "event_identifier, payload_type, payload_revision, payload, meta_data, time_stamp, " +
-        "aggregate_identifier, sequence_number, type"
+    private fun insertSql(into: String, c: StoredColumns, withIndex: Boolean) =
+        "insert into $into (${if (withIndex) "global_index, " else ""}event_identifier, payload_type, payload_revision, " +
+            "payload, meta_data, time_stamp, aggregate_identifier, sequence_number, type) " +
+            "values (${if (withIndex) "?, " else ""}?, ?, ?, ${c.payload.placeholder}, ${c.metaData.placeholder}, ?, ?, ?, ?)"
+
+    /** Select list of a table's event columns; `oid` columns are read through `lo_get`. */
+    private fun columns(c: StoredColumns, alias: String? = null): String {
+        fun plain(column: String) = if (alias == null) column else "$alias.$column"
+        return listOf(
+            plain("event_identifier"), plain("payload_type"), plain("payload_revision"),
+            c.payload.select("payload", alias), c.metaData.select("meta_data", alias),
+            plain("time_stamp"), plain("aggregate_identifier"), plain("sequence_number"), plain("type"),
+        ).joinToString(", ")
+    }
+
+    private val withIndexSql by lazy { insertSql(table, eventColumns, withIndex = true) }
+    private val identitySql by lazy { insertSql(table, eventColumns, withIndex = false) }
+    private val columns by lazy { columns(eventColumns) }
     private val snapshotDeleteSql = "delete from $snapshotTable where aggregate_identifier = ? and sequence_number < ?"
-    private val snapshotInsertSql = "insert into $snapshotTable (event_identifier, payload_type, payload_revision, " +
-        "payload, meta_data, time_stamp, aggregate_identifier, sequence_number, type) values (?,?,?,?,?,?,?,?,?)"
-    private val readSql = "select event_identifier, payload_type, payload_revision, payload, meta_data, time_stamp, " +
-        "aggregate_identifier, sequence_number, type from $table where aggregate_identifier = ? " +
-        "and sequence_number >= ? order by sequence_number asc"
+    private val snapshotUnlinkSql = "select lo_unlink(payload), lo_unlink(meta_data) from $snapshotTable " +
+        "where aggregate_identifier = ? and sequence_number < ?"
+    private val snapshotInsertSql by lazy { insertSql(snapshotTable, snapshotColumns, withIndex = false) }
+    private val readSql by lazy {
+        "select $columns from $table where aggregate_identifier = ? and sequence_number >= ? order by sequence_number asc"
+    }
 
     internal fun append(events: List<EventMessage<*>>) {
         val domainEvents = events.mapNotNull { event ->
@@ -79,8 +118,8 @@ class ThinEventStore internal constructor(
                 event.identifier,
                 payload.type.name,
                 payload.type.revision,
-                payload.data,
-                metaData.data,
+                eventColumns.payload.bind(payload.data),
+                eventColumns.metaData.bind(metaData.data),
                 DateTimeUtils.formatInstant(event.timestamp),
                 event.aggregateIdentifier,
                 event.sequenceNumber,
@@ -127,7 +166,7 @@ class ThinEventStore internal constructor(
         val result = HashMap<String, MutableList<DomainEventMessage<*>>>()
         afterSequence.entries.chunked(MAX_IDS_PER_QUERY).forEach { part ->
             val values = part.joinToString(", ") { "(?, ?)" }
-            val sql = "select ${columns.split(", ").joinToString(", ") { "e.$it" }} from $table e " +
+            val sql = "select ${columns(eventColumns, "e")} from $table e " +
                 "join (values $values) as v(aid, after_seq) " +
                 "on e.aggregate_identifier = v.aid and e.sequence_number > v.after_seq " +
                 "order by e.aggregate_identifier, e.sequence_number"
@@ -184,7 +223,7 @@ class ThinEventStore internal constructor(
     internal fun readSnapshots(aggregateIdentifiers: Collection<String>): Map<String, DomainEventMessage<*>> {
         val result = HashMap<String, DomainEventMessage<*>>()
         aggregateIdentifiers.distinct().chunked(MAX_IDS_PER_QUERY).forEach { part ->
-            val sql = "select $columns from $snapshotTable where aggregate_identifier in " +
+            val sql = "select ${columns(snapshotColumns)} from $snapshotTable where aggregate_identifier in " +
                 "(${part.joinToString(", ") { "?" }}) order by aggregate_identifier, sequence_number desc"
             val rows = jdbc.query(sql, { rs, _ -> SnapshotRow(rs) }, *part.toTypedArray())
             for (row in rows) {
@@ -206,10 +245,15 @@ class ThinEventStore internal constructor(
         val payload = snapshot.serializePayload(serializer, ByteArray::class.java)
         val metaData = snapshot.serializeMetaData(serializer, ByteArray::class.java)
         try {
+            if (PayloadStorage.OID in listOf(snapshotColumns.payload, snapshotColumns.metaData)) {
+                // large objects outlive their rows: free the replaced snapshots' ones (Axon/Hibernate leave them behind)
+                jdbc.query(snapshotUnlinkSql, { _, _ -> }, snapshot.aggregateIdentifier, snapshot.sequenceNumber)
+            }
             jdbc.update(snapshotDeleteSql, snapshot.aggregateIdentifier, snapshot.sequenceNumber)
             jdbc.update(
                 snapshotInsertSql,
-                snapshot.identifier, payload.type.name, payload.type.revision, payload.data, metaData.data,
+                snapshot.identifier, payload.type.name, payload.type.revision,
+                snapshotColumns.payload.bind(payload.data), snapshotColumns.metaData.bind(metaData.data),
                 DateTimeUtils.formatInstant(snapshot.timestamp), snapshot.aggregateIdentifier, snapshot.sequenceNumber,
                 snapshot.type,
             )
@@ -223,8 +267,8 @@ class ThinEventStore internal constructor(
     private inner class SnapshotRow(rs: ResultSet) {
         private val eventIdentifier = rs.getString("event_identifier")
         private val payloadType = SimpleSerializedType(rs.getString("payload_type"), rs.getString("payload_revision"))
-        private val payload: ByteArray = rs.getBytes("payload")
-        private val metaData: ByteArray? = rs.getBytes("meta_data")
+        private val payload: ByteArray = snapshotColumns.payload.read(rs, "payload")!!
+        private val metaData: ByteArray? = snapshotColumns.metaData.read(rs, "meta_data")
         private val timeStamp = rs.getString("time_stamp")
         val aggregateIdentifier: String = rs.getString("aggregate_identifier")
         private val sequenceNumber = rs.getLong("sequence_number")
@@ -237,8 +281,8 @@ class ThinEventStore internal constructor(
     private fun toMessage(rs: ResultSet): DomainEventMessage<*> = message(
         rs.getString("event_identifier"),
         SimpleSerializedType(rs.getString("payload_type"), rs.getString("payload_revision")),
-        rs.getBytes("payload"),
-        rs.getBytes("meta_data"),
+        eventColumns.payload.read(rs, "payload")!!,
+        eventColumns.metaData.read(rs, "meta_data"),
         rs.getString("time_stamp"),
         rs.getString("aggregate_identifier"),
         rs.getLong("sequence_number"),

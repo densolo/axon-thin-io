@@ -112,7 +112,7 @@ class ThinAxonAutoConfiguration {
         }
         return ThinEventStore(
             jdbc, serializer, config.domainEventTableName, config.snapshotEventTableName, allocator,
-            config.storeNonAggregateEvents,
+            config.storeNonAggregateEvents, config.payloadColumn.storage,
         )
     }
 
@@ -126,7 +126,10 @@ class ThinAxonAutoConfiguration {
         properties: ThinAxonProperties,
         @Qualifier("eventSerializer") serializer: Serializer,
     ): EventStoreBrowser =
-        EventStoreBrowser(dataSource, properties.eventStore.domainEventTableName, SerializerEventDecoder(serializer))
+        EventStoreBrowser(
+            dataSource, properties.eventStore.domainEventTableName, SerializerEventDecoder(serializer),
+            properties.eventStore.payloadColumn.storage,
+        )
 
     /** Axon's EventStore interface for application code that reads streams or publishes domain events directly. */
     @Bean

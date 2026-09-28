@@ -21,7 +21,17 @@ class EventStoreBrowser(
     private val table: String = "domain_event_entry",
     /** Provided by the engine's auto-configuration (the event serializer); without it [decode] is unavailable. */
     private val decoder: EventDecoder? = null,
+    /** How `payload` / `meta_data` are stored (bytea / oid / text); `null` = detect each column on first use. */
+    storage: PayloadStorage? = null,
 ) {
+    private val payloadStorage by lazy { storage ?: PayloadStorage.detect(dataSource, table, "payload") }
+    private val metaDataStorage by lazy { storage ?: PayloadStorage.detect(dataSource, table, "meta_data") }
+
+    private val columns by lazy {
+        "global_index, event_identifier, aggregate_identifier, sequence_number, type, payload_type, " +
+            "payload_revision, time_stamp, ${payloadStorage.select("payload")}, ${metaDataStorage.select("meta_data")}"
+    }
+
     /** One stored event. [payload] and [metaData] are the stored bytes as UTF-8 text. */
     data class Row(
         val globalIndex: Long,
@@ -55,7 +65,7 @@ class EventStoreBrowser(
         val ids = eventIdentifiers.distinct()
         if (ids.isEmpty()) return emptyList()
         val found = ids.chunked(MAX_LIMIT).flatMap { part ->
-            query("select $COLUMNS from $table where event_identifier in (${part.joinToString(", ") { "?" }})", part)
+            query("select $columns from $table where event_identifier in (${part.joinToString(", ") { "?" }})", part)
         }.associateBy { it.eventIdentifier }
         return ids.mapNotNull(found::get)
     }
@@ -86,7 +96,7 @@ class EventStoreBrowser(
 
     /** One aggregate's stream in sequence order, [limit] events after [afterSequence] (exclusive; `null` = from the start). */
     fun aggregate(aggregateIdentifier: String, afterSequence: Long? = null, limit: Int = 50): List<Row> = query(
-        "select $COLUMNS from $table where aggregate_identifier = ? and sequence_number > ? " +
+        "select $columns from $table where aggregate_identifier = ? and sequence_number > ? " +
             "order by sequence_number limit ${limit.coerceIn(1, MAX_LIMIT)}",
         listOf(aggregateIdentifier, afterSequence ?: -1L),
     )
@@ -102,7 +112,7 @@ class EventStoreBrowser(
         filter.from?.let { conditions += "time_stamp >= ?"; args += it }
         filter.to?.let { conditions += "time_stamp < ?"; args += it }
         val where = if (conditions.isEmpty()) "" else "where " + conditions.joinToString(" and ")
-        return query("select $COLUMNS from $table $where order by global_index desc limit ${limit.coerceIn(1, MAX_LIMIT)}", args)
+        return query("select $columns from $table $where order by global_index desc limit ${limit.coerceIn(1, MAX_LIMIT)}", args)
     }
 
     /** Number of stored events of an aggregate (for "page x of y" displays). */
@@ -131,13 +141,11 @@ class EventStoreBrowser(
         payloadType = rs.getString("payload_type"),
         payloadRevision = rs.getString("payload_revision"),
         timeStamp = rs.getString("time_stamp"),
-        payload = rs.getBytes("payload").toString(Charsets.UTF_8),
-        metaData = rs.getBytes("meta_data")?.toString(Charsets.UTF_8),
+        payload = payloadStorage.read(rs, "payload")!!.toString(Charsets.UTF_8),
+        metaData = metaDataStorage.read(rs, "meta_data")?.toString(Charsets.UTF_8),
     )
 
     private companion object {
-        const val COLUMNS = "global_index, event_identifier, aggregate_identifier, sequence_number, type, payload_type, " +
-            "payload_revision, time_stamp, payload, meta_data"
         const val MAX_LIMIT = 1000
     }
 }
