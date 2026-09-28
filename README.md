@@ -355,21 +355,175 @@ What it shows:
 
 ## Migrating a project from Axon 4
 
+### Checklist
+
 1. **Run the scanner** (`scripts/axon-usage-scan`) and check its MISSING and PARTIAL rows against the limitations
    above.
 2. **Database:** check that `bytea` payload columns and the unique index on `(aggregate_identifier, sequence_number)`
-   exist. Set `axon.thin.event-store.table-prefix` (or the table names) to match your `axon-orm.xml`.
-3. **Serializer:** keep `axon.serializer.*=jackson` semantics; thin builds the same `JacksonSerializer` from your
-   `ObjectMapper`.
-4. **Snapshots:** keep your `SnapshotTriggerDefinition` beans; thin supplies the `Snapshotter`.
-5. **Swap engines in both processes together:** replace the Axon starter with `axon-thin`. Backend and jobs switch in
-   the same release.
-6. **Use the new API where it pays off:**
+   exist.
+3. **Swap engines in both processes together:** backend and jobs switch in the same release. Do the code migration
+   below in both.
+4. **Before switching:** run your suite against thin on PostgreSQL (`-Ppostgres`), not just H2.
+5. **Afterwards, use the new API where it pays off:**
    - `sendAllAndWait` for bulk work, with `concurrencyRetries` for jobs;
    - `ChunkContext` in validation;
    - batch handlers for hot projections;
    - `@ReplayInto` plus `migrate()` for projections you want to be able to rebuild.
-7. **Before switching:** run your suite against thin on PostgreSQL (`-Ppostgres`), not just H2.
+
+### Code migration
+
+The example apps are the reference diff: `examples/task-app-axon4` and `examples/task-app-thin` run the same model,
+and the steps below are exactly what separates them.
+
+**Optional step 0: adopt the new API while still on Axon.** Add `axon-thin-api` and `axon-thin-v4-adapter` next to the
+Axon starter. `BulkCommandGateway`, `BulkOptions` and `ChunkContext` then work on Axon 4, so code using them doesn't
+change when the engine switches. `@ReplayInto` can be added at any time; Axon ignores it.
+
+#### 1. POM: application modules (the deployables)
+
+Before:
+```xml
+<dependency>
+    <groupId>org.axonframework</groupId>
+    <artifactId>axon-spring-boot-starter</artifactId>
+    <exclusions>
+        <exclusion>
+            <groupId>org.axonframework</groupId>
+            <artifactId>axon-server-connector</artifactId>
+        </exclusion>
+    </exclusions>
+</dependency>
+<!-- if you used step 0 -->
+<dependency>
+    <groupId>app.dc8</groupId>
+    <artifactId>axon-thin-v4-adapter</artifactId>
+    <version>1.0-SNAPSHOT</version>
+</dependency>
+```
+
+After:
+```xml
+<dependency>
+    <groupId>app.dc8</groupId>
+    <artifactId>axon-thin</artifactId>
+    <version>1.0-SNAPSHOT</version>
+</dependency>
+```
+
+**Remove every Axon engine artifact** from the deployables:
+- `axon-spring-boot-starter` / `axon-spring-boot-autoconfigure`;
+- `axon-server-connector`;
+- `axon-micrometer` / `axon-metrics` and `axon-tracing-*`;
+- distributed command bus extensions (JGroups, Spring Cloud).
+
+**This one is not optional.** If Axon's auto-configuration is still on the classpath, you get a mix of both engines:
+- depending on the order the auto-configurations run in, Axon's `CommandGateway` can win (thin's backs off when
+  one exists), so Axon keeps handling commands;
+- there are then two `EventGateway` beans, so injecting one fails with "expected single matching bean".
+
+**You don't add Axon jars back.** `axon-thin` brings the same ones the starter did, for their *types*:
+`axon-messaging`, `axon-modelling`, `axon-eventsourcing`, `axon-spring`, `axon-configuration` and `axon-disruptor`.
+What it leaves out:
+- the engine, `axon-spring-boot-autoconfigure`;
+- `xstream`: only Jackson is used, so code referencing `XStreamSerializer` stops compiling.
+
+The starter brought nothing non-Axon beyond `slf4j`, so removing it drops no Spring or JPA libraries. Also not
+included, so keep them if you use them:
+- Axon extensions (`axon-kotlin`, `axon-micrometer`, `axon-tracing-*`);
+- `axon-test`, in test scope.
+
+If `mvn dependency:analyze` should be clean, declare the Axon jars you use explicitly, without a version.
+
+**Versions:** if you import `axon-bom` in `dependencyManagement`, it overrides the Axon versions thin brings. Keep it
+at the version thin is built against (4.13.2), or remove the import.
+
+#### 2. POM: model and library modules
+
+Modules that only contain aggregates, events, handlers and projections don't change. They keep their Axon
+dependencies for the annotations, typically `provided`. Add `axon-thin-api` wherever you use `BulkCommandGateway`,
+`ChunkContext` or `@ReplayInto`:
+```xml
+<dependency>
+    <groupId>app.dc8</groupId>
+    <artifactId>axon-thin-api</artifactId>
+    <version>1.0-SNAPSHOT</version>
+</dependency>
+```
+
+`axon-test` can stay in test scope: `AggregateTestFixture` unit-tests aggregates without any engine.
+
+#### 3. `application.yml`
+
+Before:
+```yaml
+spring:
+  jpa:
+    mapping-resources: META-INF/axon-orm.xml      # renames Axon's JPA entities (axon_ prefix)
+axon:
+  axonserver:
+    enabled: false
+  serializer:
+    general: jackson
+    events: jackson
+    messages: jackson
+  eventhandling:
+    processors:
+      task-summary:
+        mode: subscribing
+```
+
+After:
+```yaml
+axon:
+  thin:
+    event-handler-error-mode: propagate          # if you registered PropagatingErrorHandler; Axon's default is log
+    concurrency-retries: 0                       # default for sendAndWait; jobs pass BulkOptions per call
+    event-store:
+      table-prefix: axon_                        # same tables your axon-orm.xml pointed to
+      # global-index: { strategy: identity }     # only if your orm.xml maps global_index as IDENTITY
+      # global-index: { sequence-name: my_seq, allocation-size: 50 }   # if your orm.xml defines its own generator
+```
+
+- **`axon.*` keys are no longer read.** Thin ignores `axon.serializer.*`: it always builds Axon's `JacksonSerializer`
+  from your `ObjectMapper` (a `defaultAxonObjectMapper` bean if you have one). The `axon.eventhandling.processors.*`
+  keys are ignored too, because everything is subscribing.
+- **`axon-orm.xml`** is only needed if something still relies on Hibernate knowing Axon's entities, for example
+  `ddl-auto` creating those tables. Thin writes the tables with JDBC. If Liquibase owns the schema, drop the file from
+  `spring.jpa.mapping-resources`.
+
+#### 4. Code that must change
+
+| Axon 4 code | On thin | Change to |
+|---|---|---|
+| `EventProcessingConfigurer` / `Configurer` / `ConfigurerModule` customization (`registerSubscribingEventProcessor`, error handlers, …) | the beans don't exist: **startup fails** on an injection point | delete it; use `axon.thin.event-handler-error-mode` for the error handler |
+| injecting `EventBus` / `EventStore` | not provided | `EventGateway.publish(…)` |
+| injecting `CommandBus` | not provided | `CommandGateway` |
+| `Repository<T>` (`load(id).execute { … }`) | not provided | send a command to the aggregate |
+| `QueryGateway` / `@QueryHandler` | not supported | call the service or repository directly |
+| injecting `Configuration`, `TokenStore`, `EventProcessingModule` | not provided | remove |
+| sagas, deadlines, `@AggregateMember`, upcasters | not supported | see *Limitations* |
+
+#### 5. Code that stays as it is
+
+- `@Aggregate` (including `snapshotTriggerDefinition`), `@AggregateIdentifier`, `@CommandHandler` (constructors
+  too), `@CreationPolicy`, `@EventSourcingHandler`, and `AggregateLifecycle.apply` / `markDeleted`.
+- `@EventHandler` projections (`@ProcessingGroup` is accepted and ignored), `@MetaDataValue`, `@Timestamp`,
+  `@SequenceNumber`, and Spring-bean handler parameters.
+- `CommandGateway` (`send`, `sendAndWait`, callbacks), `EventGateway`, and dispatch interceptors.
+- `SnapshotTriggerDefinition` beans (for example `EventCountSnapshotTriggerDefinition(snapshotter, 100)`); thin
+  provides the `Snapshotter` they take.
+- Exceptions you catch: `AggregateNotFoundException`, `AggregateDeletedException`, `ConcurrencyException`,
+  `AggregateStreamCreationException` and `CommandExecutionException` are the same classes, thrown in the same
+  situations.
+
+#### 6. Verify
+
+- **Startup log:** `axon-thin registered N command handler(s), M aggregate(s) [Task, …] and K event handling
+  bean(s)`. Compare the counts with your code.
+- **No Axon engine left:** Axon's startup lines (`AxonAutoConfiguration`, `EventProcessor … started`) must not
+  appear, and no rows may appear in `token_entry`.
+- **Tests:** run them on PostgreSQL (`-Ppostgres`); H2 hides locking and column-type differences. Re-run the scanner:
+  anything still marked MISSING is either unused or needs one of the changes above.
 
 ## Build & test
 
