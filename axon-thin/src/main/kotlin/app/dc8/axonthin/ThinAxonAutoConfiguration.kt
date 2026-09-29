@@ -4,6 +4,7 @@ import app.dc8.axonthin.aggregate.ThinSnapshotter
 import app.dc8.axonthin.api.ChunkContext
 import app.dc8.axonthin.api.EventStoreBrowser
 import app.dc8.axonthin.eventstore.SerializerEventDecoder
+import app.dc8.axonthin.eventstore.EventStoreSchema
 import app.dc8.axonthin.eventstore.GlobalIndexAllocator
 import app.dc8.axonthin.eventstore.ThinAxonEventStore
 import app.dc8.axonthin.eventstore.PooledSequenceAllocator
@@ -25,6 +26,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnClass
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.boot.context.properties.EnableConfigurationProperties
+import org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitialization
 import org.springframework.context.annotation.Bean
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.transaction.PlatformTransactionManager
@@ -97,12 +99,14 @@ class ThinAxonAutoConfiguration {
     @Bean
     @ConditionalOnBean(DataSource::class)
     @ConditionalOnProperty(prefix = "axon.thin.event-store", name = ["enabled"], matchIfMissing = true)
+    @DependsOnDatabaseInitialization // Liquibase / Flyway / spring.sql.init run first, so `schema` sees the final schema
     fun thinEventStore(
         dataSource: DataSource,
         @Qualifier("eventSerializer") serializer: Serializer,
         properties: ThinAxonProperties,
     ): ThinEventStore {
         val config = properties.eventStore
+        EventStoreSchema(dataSource, config).apply(config.schema)
         val jdbc = JdbcTemplate(dataSource)
         val allocator = when (config.globalIndex.strategy) {
             ThinAxonProperties.GlobalIndex.Strategy.IDENTITY -> GlobalIndexAllocator.IDENTITY

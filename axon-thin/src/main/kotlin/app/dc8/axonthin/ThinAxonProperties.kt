@@ -52,6 +52,14 @@ class ThinAxonProperties {
          */
         var payloadColumn: PayloadColumn = PayloadColumn.AUTO
 
+        /**
+         * `none` (default): thin does not touch the schema. `validate`: check tables, columns, the unique index on
+         * (aggregate_identifier, sequence_number) and the sequence increment at startup. `create-if-missing`
+         * (dev/tests): create missing tables and the sequence — with [payloadColumn] as column type (`auto` → binary)
+         * — never altering or dropping anything; then validate. Runs after Liquibase / Flyway / spring.sql.init.
+         */
+        var schema: SchemaMode = SchemaMode.NONE
+
         enum class PayloadColumn(val storage: PayloadStorage?) {
             AUTO(null), BINARY(PayloadStorage.BINARY), OID(PayloadStorage.OID), TEXT(PayloadStorage.TEXT)
         }
@@ -60,6 +68,8 @@ class ThinAxonProperties {
 
         val snapshotEventTableName: String get() = tablePrefix + snapshotEventTable
     }
+
+    enum class SchemaMode { NONE, VALIDATE, CREATE_IF_MISSING }
 
     class GlobalIndex {
         /**

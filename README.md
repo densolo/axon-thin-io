@@ -330,6 +330,31 @@ This covers aggregates, snapshots, replays, the `EventStore` bean and `EventStor
 - **Converting:** Liquibase changesets for `oid → bytea`, `oid → text`, `bytea ↔ text` are in `docs/liquibase`, with a
   procedure. `PayloadConversionTest` runs them against real data and restarts the application on the new type.
 
+### Event store schema: `axon.thin.event-store.schema`
+
+Thin can create or check its own two tables and the `global_index` sequence. It uses your configured prefix and
+table names, the sequence settings, and the payload column type:
+
+```yaml
+axon.thin.event-store:
+  schema: create-if-missing   # none (default) | validate | create-if-missing
+  payload-column: text        # the type used when creating: bytea/blob (binary), text/clob (text), oid (PostgreSQL)
+```
+
+| Mode | Use | What it does |
+|---|---|---|
+| `none` | default | nothing |
+| `create-if-missing` | dev, H2 tests (no Liquibase needed) | creates the event and snapshot tables (with the unique index on aggregate id + sequence) and the sequence (increment = `allocation-size`) **only if missing**; never alters or drops; then validates |
+| `validate` | production | checks tables and columns, **the unique index** (Hibernate's `validate` can't), the sequence's existence and **increment = `allocation-size`**, and a forced `payload-column` type; fails startup listing every problem |
+
+- **Ordering:** it runs after Liquibase, Flyway and `spring.sql.init` (the event store bean is marked
+  `@DependsOnDatabaseInitialization`), so `validate` checks the final schema.
+- **Hibernate:** your read models stay with Hibernate as before. Thin's tables are not JPA entities, so
+  Hibernate's `validate` ignores them.
+- **Databases:** creation supports H2 and PostgreSQL; validation works on any database with `information_schema`.
+- **Tests:** `EventStoreSchemaTest` checks create-if-missing (per payload type, idempotent, leaves existing
+  schemas alone) and validate (empty database, missing unique index, wrong increment, correct schema).
+
 ### Processing groups
 
 Thin accepts `@ProcessingGroup` and ignores it: every event handler bean receives every event, as one subscribing
@@ -366,7 +391,7 @@ come from.
 
 **Data and schema**
 - **Unique index on `(aggregate_identifier, sequence_number)`.** It is the only concurrency guard. An orm.xml
-  `<table>` override drops Axon's own `@Table` index, so check that your database still has it.
+  `<table>` override drops Axon's own `@Table` index. `axon.thin.event-store.schema: validate` checks it at startup.
 - **Payload columns on PostgreSQL** may be `bytea`, `oid` (large objects) or `text`. Each column's type is detected on
   first use per process, so restart after converting. See *Payload column types*.
 - **The `global_index` sequence's `INCREMENT BY` equals `allocation-size`** (50 by default, as Hibernate creates
