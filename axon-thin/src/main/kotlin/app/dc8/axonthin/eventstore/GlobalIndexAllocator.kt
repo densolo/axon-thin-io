@@ -52,7 +52,7 @@ internal class PooledSequenceAllocator(
         while (result.size < count) {
             val blocks = (count - result.size + allocationSize - 1) / allocationSize
             val highs = jdbc.queryForList(nextValuesSql, Long::class.java, blocks)
-            for (h in highs) {
+            for (h in highs.map { it!! }) {
                 high = h
                 next = maxOf(1, h - allocationSize + 1)
                 while (result.size < count && next <= high) result += next++

@@ -6,7 +6,7 @@ import org.hibernate.service.ServiceRegistry
 import org.hibernate.type.SqlTypes
 import org.hibernate.type.descriptor.jdbc.BinaryJdbcType
 import org.springframework.test.context.DynamicPropertyRegistry
-import org.testcontainers.containers.PostgreSQLContainer
+import org.testcontainers.postgresql.PostgreSQLContainer
 import java.sql.DriverManager
 import java.sql.Types
 
@@ -29,7 +29,7 @@ object PostgresSupport {
 
     val enabled: Boolean = System.getProperty("thin.test.db") == "postgres"
 
-    private val container: PostgreSQLContainer<*> by lazy {
+    private val container: PostgreSQLContainer by lazy {
         PostgreSQLContainer("postgres:17-alpine")
             // a 1k all-or-nothing chunk must fit in the lock table; production should use the same setting
             .withCommand("postgres", "-c", "max_locks_per_transaction=256", "-c", "fsync=off")

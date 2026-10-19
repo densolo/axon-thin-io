@@ -30,7 +30,7 @@ class Axon4BulkCommandGateway(
         var attempt = 0
         while (true) {
             try {
-                return transaction.execute { runChunk(commands) }!! as List<R>
+                return transaction.execute { runChunk(commands) } as List<R>
             } catch (e: ConcurrencyException) {
                 if (!ownsTransaction || attempt >= options.concurrencyRetries) throw e
                 attempt++

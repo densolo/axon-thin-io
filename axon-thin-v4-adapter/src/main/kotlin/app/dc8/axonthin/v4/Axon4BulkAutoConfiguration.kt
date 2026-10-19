@@ -17,9 +17,9 @@ import javax.sql.DataSource
 @AutoConfiguration(
     afterName = [
         "org.axonframework.springboot.autoconfig.AxonAutoConfiguration",
-        "org.springframework.boot.autoconfigure.transaction.TransactionAutoConfiguration",
-        "org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration",
-        "org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration",
+        "org.springframework.boot.transaction.autoconfigure.TransactionAutoConfiguration",
+        "org.springframework.boot.hibernate.autoconfigure.HibernateJpaAutoConfiguration",
+        "org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration",
     ],
 )
 class Axon4BulkAutoConfiguration {

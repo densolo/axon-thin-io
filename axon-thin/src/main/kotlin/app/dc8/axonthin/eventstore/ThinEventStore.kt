@@ -179,7 +179,7 @@ class ThinEventStore internal constructor(
 
     /** Every payload type stored (one scan; an index on `payload_type` makes it an index-only scan). */
     internal fun distinctPayloadTypes(): List<String> =
-        jdbc.queryForList("select distinct payload_type from $table", String::class.java)
+        jdbc.queryForList("select distinct payload_type from $table", String::class.java).map { it!! }
 
     /** A replayed event with its position in the table. */
     internal class ReplayEvent(val globalIndex: Long, val message: DomainEventMessage<*>)

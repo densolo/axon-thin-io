@@ -165,7 +165,7 @@ class AxonStorageInteropTest {
         TransactionTemplate(transactionManager).execute {
             val snapshot = axon.readSnapshot(aggregateId).orElseThrow()
             listOf(snapshot) + axon.readEvents(aggregateId, snapshot.sequenceNumber + 1).asStream().toList()
-        }!!
+        }
 
     @Test
     fun `global index allocation from both engines never collides`() {

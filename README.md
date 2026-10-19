@@ -142,6 +142,9 @@ Rows are written exactly like Axon's `JpaEventStorageEngine` writes them:
      (the `@Primary` one if there are several);
   4. else a `JacksonSerializer` on `defaultAxonObjectMapper` or the primary `ObjectMapper`.
 
+  Spring Boot 4 auto-configures Jackson 3, so add `spring-boot-jackson2` to get a Jackson 2 `ObjectMapper` bean (Axon 4's
+  `JacksonSerializer` uses Jackson 2). Without it, thin falls back to `ObjectMapper().findAndRegisterModules()`.
+
   The contract suite checks this with such a bean, whose extra Jackson module changes the JSON: both engines store
   identical bytes.
 - **Type and revision:** `payload_type` is the class name, and `payload_revision` comes from `@Revision`.
@@ -592,7 +595,7 @@ included, so keep them if you use them:
 If `mvn dependency:analyze` should be clean, declare the Axon jars you use explicitly, without a version.
 
 **Versions:** if you import `axon-bom` in `dependencyManagement`, it overrides the Axon versions thin brings. Keep it
-at the version thin is built against (4.13.2), or remove the import.
+at the version thin is built against (4.13.3), or remove the import.
 
 #### 2. POM: model and library modules
 
@@ -646,7 +649,8 @@ axon:
   keys are ignored too, because everything is subscribing.
 - **`axon-orm.xml`** is only needed if something still relies on Hibernate knowing Axon's entities, for example
   `ddl-auto` creating those tables. Thin writes the tables with JDBC. If Liquibase owns the schema, drop the file from
-  `spring.jpa.mapping-resources`.
+  `spring.jpa.mapping-resources`. On Hibernate 7 (Spring Boot 4) its `<entity>` elements need `access="FIELD"`, or
+  startup fails because the `@IdClass` of `SnapshotEventEntry` "has no persistent properties".
 
 #### 4. Code that must change
 
@@ -706,4 +710,4 @@ mvn test -Ppostgres -pl examples/task-app-thin -Dtest=PostgresChunkBenchmarkTest
   reference guide), except `OidPayloadStorageTest`, which uses Hibernate's default `oid`.
 - **PostgreSQL-only tests** also include `OidPayloadStorageTest` and `PayloadConversionTest`.
 
-JDK 21+ (bytecode target 21), Kotlin 2.4, Spring Boot 3.5, H2 and PostgreSQL 17.
+JDK 21+ (bytecode target 21), Kotlin 2.4, Spring Boot 4.1, H2 and PostgreSQL 17.

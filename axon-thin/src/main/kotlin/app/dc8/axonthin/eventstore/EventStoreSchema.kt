@@ -147,7 +147,7 @@ internal class EventStoreSchema(
         val sql = "select column_name from information_schema.columns where upper(table_name) = upper(?)" +
             (if (schema != null) " and upper(table_schema) = upper(?)" else "")
         val args = listOfNotNull(name, schema).toTypedArray()
-        return jdbc.queryForList(sql, String::class.java, *args).map { it.lowercase() }.toSet()
+        return jdbc.queryForList(sql, String::class.java, *args).map { it!!.lowercase() }.toSet()
     }
 
     private fun hasUniqueIndex(table: String, columns: Set<String>): Boolean = dataSource.connection.use { connection ->

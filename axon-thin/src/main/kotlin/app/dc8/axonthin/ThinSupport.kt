@@ -14,10 +14,7 @@ internal class ThinTransactions(transactionManager: PlatformTransactionManager?)
 
     fun <T> inTransaction(block: () -> T): T =
         if (template == null) block()
-        else {
-            @Suppress("UNCHECKED_CAST")
-            template.execute { block() } as T
-        }
+        else template.execute { block() }
 }
 
 /**
