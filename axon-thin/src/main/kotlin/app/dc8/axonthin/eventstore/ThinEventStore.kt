@@ -95,8 +95,6 @@ class ThinEventStore internal constructor(
     private val identitySql by lazy { insertSql(table, eventColumns, withIndex = false) }
     private val columns by lazy { columns(eventColumns) }
     private val snapshotDeleteSql = "delete from $snapshotTable where aggregate_identifier = ? and sequence_number < ?"
-    private val snapshotUnlinkSql = "select lo_unlink(payload), lo_unlink(meta_data) from $snapshotTable " +
-        "where aggregate_identifier = ? and sequence_number < ?"
     private val snapshotInsertSql by lazy { insertSql(snapshotTable, snapshotColumns, withIndex = false) }
     private val readSql by lazy {
         "select $columns from $table where aggregate_identifier = ? and sequence_number >= ? order by sequence_number asc"
@@ -241,25 +239,43 @@ class ThinEventStore internal constructor(
     }
 
     /** Axon's JpaEventStorageEngine.storeSnapshot: drop older snapshots of the aggregate, insert the new one. */
-    internal fun storeSnapshot(snapshot: DomainEventMessage<*>) {
-        val payload = snapshot.serializePayload(serializer, ByteArray::class.java)
-        val metaData = snapshot.serializeMetaData(serializer, ByteArray::class.java)
-        try {
-            if (PayloadStorage.OID in listOf(snapshotColumns.payload, snapshotColumns.metaData)) {
-                // large objects outlive their rows: free the replaced snapshots' ones (Axon/Hibernate leave them behind)
-                jdbc.query(snapshotUnlinkSql, { _, _ -> }, snapshot.aggregateIdentifier, snapshot.sequenceNumber)
-            }
-            jdbc.update(snapshotDeleteSql, snapshot.aggregateIdentifier, snapshot.sequenceNumber)
-            jdbc.update(
-                snapshotInsertSql,
+    internal fun storeSnapshot(snapshot: DomainEventMessage<*>) = storeSnapshots(listOf(snapshot))
+
+    /**
+     * [storeSnapshot] for many aggregates (one snapshot each): one JDBC batch of deletes, one of inserts, plus one
+     * `lo_unlink` query per [MAX_IDS_PER_QUERY] aggregates on `oid` columns.
+     */
+    internal fun storeSnapshots(snapshots: List<DomainEventMessage<*>>) {
+        if (snapshots.isEmpty()) return
+        val rows = snapshots.map { snapshot ->
+            val payload = snapshot.serializePayload(serializer, ByteArray::class.java)
+            val metaData = snapshot.serializeMetaData(serializer, ByteArray::class.java)
+            arrayOf(
                 snapshot.identifier, payload.type.name, payload.type.revision,
                 snapshotColumns.payload.bind(payload.data), snapshotColumns.metaData.bind(metaData.data),
                 DateTimeUtils.formatInstant(snapshot.timestamp), snapshot.aggregateIdentifier, snapshot.sequenceNumber,
                 snapshot.type,
             )
+        }
+        val replaced = snapshots.map { arrayOf<Any>(it.aggregateIdentifier, it.sequenceNumber) }
+        try {
+            if (PayloadStorage.OID in listOf(snapshotColumns.payload, snapshotColumns.metaData)) {
+                // large objects outlive their rows: free the replaced snapshots' ones (Axon/Hibernate leave them behind)
+                replaced.chunked(MAX_IDS_PER_QUERY).forEach { part ->
+                    val values = part.joinToString(", ") { "(?, ?)" }
+                    val sql = "select lo_unlink(s.payload), lo_unlink(s.meta_data) from $snapshotTable s " +
+                        "join (values $values) as v(aid, before_seq) " +
+                        "on s.aggregate_identifier = v.aid and s.sequence_number < v.before_seq"
+                    jdbc.query(sql, { _, _ -> }, *part.flatMap { it.asList() }.toTypedArray())
+                }
+            }
+            jdbc.batchUpdate(snapshotDeleteSql, replaced)
+            jdbc.batchUpdate(snapshotInsertSql, rows)
         } catch (e: DuplicateKeyException) {
-            throw ConcurrencyException("A snapshot for aggregate [${snapshot.aggregateIdentifier}] at sequence " +
-                "[${snapshot.sequenceNumber}] was already inserted", e)
+            val detail = e.mostSpecificCause.message.orEmpty()
+            val failed = snapshots.firstOrNull { detail.contains(it.aggregateIdentifier) } ?: snapshots.first()
+            throw ConcurrencyException("A snapshot for aggregate [${failed.aggregateIdentifier}] at sequence " +
+                "[${failed.sequenceNumber}] was already inserted", e)
         }
     }
 

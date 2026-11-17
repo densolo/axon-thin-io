@@ -191,6 +191,12 @@ Axon's `SpringAggregateSnapshotter`. It works like Axon's `AbstractSnapshotter` 
 - it replaces older snapshots of the same aggregate;
 - the snapshot carries the triggering command's `correlationId`/`traceId`.
 
+Snapshots are set-based like the rest of a chunk: every aggregate a transaction scheduled is rebuilt and stored in
+one transaction. That takes two reads (snapshots, then events), one JDBC batch of deletes and one of inserts,
+however many aggregates crossed their threshold. If that transaction fails (say, another process already stored
+one of the snapshots), thin rolls it back and retries each aggregate in its own transaction. One failing snapshot
+never costs the others.
+
 On load, thin reads the latest snapshot plus the events after it, as Axon's `AbstractEventStore` does. Snapshots
 serialize the aggregate itself with the event serializer (Jackson), so aggregate state must be visible to Jackson.
 The example uses `@JsonAutoDetect(fieldVisibility = ANY)`.

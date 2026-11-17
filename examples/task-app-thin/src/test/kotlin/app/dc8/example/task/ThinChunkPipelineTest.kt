@@ -82,6 +82,8 @@ class ThinChunkPipelineTest {
     private val eventReads = { sql: String -> sql.startsWith("select") && sql.contains("from axon_domain_event_entry") }
     private val snapshotReads = { sql: String -> sql.startsWith("select") && sql.contains("from axon_snapshot_event_entry") }
     private val eventInserts = { sql: String -> sql.startsWith("insert into axon_domain_event_entry") }
+    private val snapshotDeletes = { sql: String -> sql.startsWith("delete from axon_snapshot_event_entry") }
+    private val snapshotInserts = { sql: String -> sql.startsWith("insert into axon_snapshot_event_entry") }
     private val sequenceFetches = { sql: String -> sql.contains("axon_domain_event_entry_seq") } // H2 and PostgreSQL syntax
 
     private fun createTasks(count: Int): List<String> =
@@ -123,6 +125,39 @@ class ThinChunkPipelineTest {
         assertThat(recorder.count(eventReads)).isEqualTo(1)
         assertThat(withSnapshot).allSatisfy { assertThat(stored.forAggregate(it).last().sequenceNumber).isEqualTo(5L) }
         assertThat(plain).allSatisfy { assertThat(queries.summary(it)!!.title).isEqualTo("t-new") }
+    }
+
+    @Test
+    fun `snapshots triggered by a chunk are built and stored together`() {
+        val ids = createTasks(10)
+        repeat(3) { round -> bulk.sendAllAndWait<Any?>(ids.map { RenameTaskCommand(it, "r$round") }) }
+        recorder.clear()
+
+        bulk.sendAllAndWait<Any?>(ids.map { RenameTaskCommand(it, "r3") }) // seq 4 for all ten → ten snapshots
+
+        assertThat(recorder.count(snapshotReads)).isEqualTo(2) // preload + snapshotter
+        assertThat(recorder.count(eventReads)).isEqualTo(2)
+        assertThat(recorder.count(snapshotDeletes)).isEqualTo(1)
+        assertThat(recorder.count(snapshotInserts)).isEqualTo(1) // one JDBC batch …
+        assertThat(recorder.rows(snapshotInserts)).isEqualTo(10) // … carrying all ten snapshots
+        assertThat(ids).allSatisfy { assertThat(stored.snapshots(it).map { s -> s.sequenceNumber }).containsExactly(4L) }
+    }
+
+    @Test
+    fun `a snapshot that conflicts does not cost the others of the chunk`() {
+        val ids = createTasks(3)
+        repeat(3) { round -> bulk.sendAllAndWait<Any?>(ids.map { RenameTaskCommand(it, "r$round") }) }
+        jdbc.update( // another process already stored the snapshot at seq 4 of the second task
+            "insert into axon_snapshot_event_entry (sequence_number, aggregate_identifier, event_identifier, " +
+                "payload_type, time_stamp, type, payload) values (4, ?, ?, 'other', 'now', 'Task', ?)",
+            ids[1], id(), "{}".toByteArray(),
+        )
+
+        bulk.sendAllAndWait<Any?>(ids.map { RenameTaskCommand(it, "r3") })
+
+        assertThat(stored.snapshots(ids[0]).single().payload).containsEntry("title", "r3")
+        assertThat(stored.snapshots(ids[1]).single().payloadType).isEqualTo("other")
+        assertThat(stored.snapshots(ids[2]).single().payload).containsEntry("title", "r3")
     }
 
     // ---- projections --------------------------------------------------------------------------------------------------
